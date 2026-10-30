@@ -10,7 +10,7 @@ public abstract class BaseDatabaseAgent implements DatabaseAgent {
     public List<ObjectInfo> listObjects(String schema) {
         List<ObjectInfo> result = new ArrayList<>();
         for (TableInfo table : listTables(schema)) {
-            result.add(new ObjectInfo(table.getName(), table.getTable_type(), schema, table.getComment()));
+            result.add(new ObjectInfo(table.getName(), table.getTable_type(), schema, table.getComment(), table.getValid()));
         }
         return result;
     }
@@ -41,57 +41,90 @@ public abstract class BaseDatabaseAgent implements DatabaseAgent {
             foreignKeys = Collections.emptyList();
         }
 
-        return DatabaseAgent.buildTableDdl(schema, table, getColumns(schema, table), indexes, foreignKeys);
+        String tableComment = null;
+        try {
+            tableComment = getTableComment(schema, table);
+        } catch (RuntimeException e) {
+            // Table comment is optional; DDL generation should still succeed without it.
+        }
+
+        return DdlBuilder.buildTableDdl(
+            schema, table, getColumns(schema, table), indexes, foreignKeys,
+            Collections.emptyList(), false, includeColumnCommentsInTableDdl(), tableComment
+        );
+    }
+
+    protected boolean includeColumnCommentsInTableDdl() {
+        return false;
     }
 
     @Override
     public QueryPageResult executeQueryPage(String sql, String schema, QueryPageOptions options) {
         Connection conn = requireConnected();
-        return JdbcExecutor.INSTANCE.executePage(
+        return JdbcExecutor.current().executePage(
             conn,
             sql,
             schema,
             this::setSchemaSQL,
+            this::resetSchemaSQL,
             options,
-            JdbcExecutor.INSTANCE::defaultResultValue
+            JdbcExecutor.current()::defaultResultValue
         );
     }
 
     @Override
     public QueryPageResult fetchQueryPage(String sessionId, int pageSize) {
-        return JdbcExecutor.INSTANCE.fetchPage(sessionId, pageSize);
+        return JdbcExecutor.current().fetchPage(sessionId, pageSize);
     }
 
     @Override
     public boolean closeQuerySession(String sessionId) {
-        return JdbcExecutor.INSTANCE.closeQuerySession(sessionId);
+        return JdbcExecutor.current().closeQuerySession(sessionId);
     }
 
     @Override
     public QueryPageResult startTableRead(String sql, String schema, QueryPageOptions options) {
-        return JdbcExecutor.INSTANCE.startTableRead(
+        return JdbcExecutor.current().startTableRead(
             requireConnected(),
             sql,
             schema,
             this::setSchemaSQL,
+            this::resetSchemaSQL,
             options,
-            JdbcExecutor.INSTANCE::defaultResultValue
+            JdbcExecutor.current()::defaultResultValue
         );
     }
 
     @Override
     public QueryPageResult fetchTableReadPage(String sessionId, int pageSize) {
-        return JdbcExecutor.INSTANCE.fetchTableReadPage(sessionId, pageSize);
+        return JdbcExecutor.current().fetchTableReadPage(sessionId, pageSize);
     }
 
     @Override
     public boolean closeTableReadSession(String sessionId) {
-        return JdbcExecutor.INSTANCE.closeTableReadSession(sessionId);
+        return JdbcExecutor.current().closeTableReadSession(sessionId);
     }
 
     @Override
     public QueryResult executeTransaction(List<String> statements, String schema) {
-        return TransactionExecutor.executeUpdateStatements(requireConnected(), statements, schema, this::setSchemaSQL);
+        return TransactionExecutor.executeUpdateStatements(
+            requireConnected(),
+            statements,
+            schema,
+            this::setSchemaSQL,
+            this::resetSchemaSQL
+        );
+    }
+
+    @Override
+    public QueryResult executeBatch(List<String> statements, String schema) {
+        return BatchExecutor.executeBatchStatements(
+            requireConnected(),
+            statements,
+            schema,
+            this::setSchemaSQL,
+            this::resetSchemaSQL
+        );
     }
 
     protected Connection requireConnected() {

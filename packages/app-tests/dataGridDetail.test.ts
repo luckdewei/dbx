@@ -1,8 +1,19 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
 
-import { buildDataGridCellDetail, buildDataGridColumnDetail, dataGridColumnDetailJson, dataGridColumnDetailTsv, buildDataGridRowDetail, dataGridRowDetailJson, dataGridRowDetailTsv, filterDataGridDetailFields, type DataGridCellDetail } from "../../apps/desktop/src/lib/dataGridDetail.ts";
-import type { CellValue } from "../../apps/desktop/src/lib/cellValue.ts";
+import {
+  buildDataGridCellDetail,
+  buildDataGridColumnDetail,
+  dataGridColumnDetailJson,
+  dataGridColumnDetailTsv,
+  buildDataGridRowDetail,
+  dataGridRowDetailJson,
+  dataGridRowDetailTsv,
+  filterDataGridDetailFields,
+  jsonDetailDisplayValue,
+  type DataGridCellDetail,
+} from "../../apps/desktop/src/lib/dataGrid/dataGridDetail.ts";
+import type { CellValue } from "../../apps/desktop/src/lib/dataGrid/cellValue.ts";
 
 test("buildDataGridCellDetail returns null for an invalid column", () => {
   const detail = buildDataGridCellDetail({
@@ -45,12 +56,33 @@ test("buildDataGridCellDetail preserves full value metadata", () => {
     rawValuePreview: '{"ok":true,"items":[1,2]}',
     displayValue: 'formatted:{"ok":tr',
     displayValuePreview: 'formatted:{"ok":tr',
+    isSourceTruncated: false,
     isValuePreviewTruncated: false,
     imagePreviewUrl: null,
     length: 25,
+    isNull: false,
     formattedJson: '{\n  "ok": true,\n  "items": [\n    1,\n    2\n  ]\n}',
     isEditable: true,
   });
+});
+
+test("buildDataGridCellDetail preserves a leading newline in the full value", () => {
+  const status = "\n=====================================\nINNODB MONITOR OUTPUT\nbody";
+  const detail = buildDataGridCellDetail({
+    rowIndex: 0,
+    rowId: 1,
+    row: [status],
+    columns: ["Status"],
+    columnIndex: 0,
+    displayValue: (value) => String(value),
+    isEditable: false,
+  });
+
+  assert.equal(detail?.value, status);
+  assert.equal(detail?.rawValue, status);
+  assert.equal(detail?.rawValuePreview, status);
+  assert.equal(detail?.displayValue, status);
+  assert.equal(detail?.displayValuePreview, status);
 });
 
 test("buildDataGridCellDetail reports image preview URLs", () => {
@@ -67,8 +99,63 @@ test("buildDataGridCellDetail reports image preview URLs", () => {
   assert.equal(detail?.imagePreviewUrl, "https://example.com/avatar.png");
 });
 
+test("buildDataGridCellDetail reports binary image preview URLs", () => {
+  const detail = buildDataGridCellDetail({
+    rowIndex: 0,
+    rowId: 1,
+    row: ["0x89504e470d0a1a0a0000000d49484452"],
+    columns: ["avatar"],
+    columnIndex: 0,
+    typeByColumn: new Map([["avatar", "longblob"]]),
+    displayValue: (value) => String(value),
+    isEditable: false,
+  });
+
+  assert.match(detail?.imagePreviewUrl ?? "", /^data:image\/png;base64,/);
+});
+
+test("buildDataGridCellDetail uses result column types for query results", () => {
+  const detail = buildDataGridCellDetail({
+    rowIndex: 0,
+    rowId: 1,
+    row: [30001, "0x89504e470d0a1a0a0000000d49484452"],
+    columns: ["id", "image_data"],
+    columnIndex: 1,
+    resultColumnTypes: ["bigint", "longblob"],
+    displayValue: (value) => String(value),
+    isEditable: false,
+  });
+
+  assert.equal(detail?.type, "longblob");
+  assert.match(detail?.imagePreviewUrl ?? "", /^data:image\/png;base64,/);
+});
+
+test("aggregate details defer binary image preview generation", () => {
+  const rowDetail = buildDataGridRowDetail({
+    rowIndex: 0,
+    rowId: 1,
+    row: ["0x89504e470d0a1a0a0000000d49484452"],
+    columns: ["avatar"],
+    columnIndexes: [0],
+    resultColumnTypes: ["longblob"],
+    displayValue: (value) => String(value),
+  });
+  const columnDetail = buildDataGridColumnDetail({
+    rows: [{ rowIndex: 0, rowId: 1, row: ["0x89504e470d0a1a0a0000000d49484452"] }],
+    columns: ["avatar"],
+    columnIndex: 0,
+    resultColumnTypes: ["longblob"],
+    displayValue: (value) => String(value),
+  });
+
+  assert.equal(rowDetail.fields[0]?.type, "longblob");
+  assert.equal(rowDetail.fields[0]?.imagePreviewUrl, null);
+  assert.equal(columnDetail?.fields[0]?.type, "longblob");
+  assert.equal(columnDetail?.fields[0]?.imagePreviewUrl, null);
+});
+
 test("buildDataGridCellDetail limits rendered previews for huge text values", () => {
-  const hugeJson = `{"body":"${"x".repeat(120_000)}"}`;
+  const hugeJson = `{"body":"${"x".repeat(600_000)}"}`;
   const detail = buildDataGridCellDetail({
     rowIndex: 0,
     rowId: 1,
@@ -86,6 +173,24 @@ test("buildDataGridCellDetail limits rendered previews for huge text values", ()
   assert.equal(detail.displayValuePreview.length, 12_000);
   assert.equal(detail.isValuePreviewTruncated, true);
   assert.equal(detail.formattedJson, "");
+});
+
+test("buildDataGridCellDetail formats large JSON values within the format limit", () => {
+  const largeJson = `{"body":"${"x".repeat(120_000)}"}`;
+  const detail = buildDataGridCellDetail({
+    rowIndex: 0,
+    rowId: 1,
+    row: [largeJson],
+    columns: ["payload"],
+    columnIndex: 0,
+    typeByColumn: new Map([["payload", "nvarchar(max)"]]),
+    displayValue: (value) => String(value),
+    isEditable: false,
+  });
+
+  assert.ok(detail);
+  assert.notEqual(detail.formattedJson, "");
+  assert.ok(detail.formattedJson.startsWith('{\n  "body":'));
 });
 
 test("buildDataGridRowDetail maps requested column indexes in order", () => {
@@ -147,9 +252,58 @@ test("dataGridRowDetailJson and dataGridRowDetailTsv format copy payloads", () =
   });
 
   assert.equal(dataGridRowDetailJson(detail), '{\n  "id": 1,\n  "name": "Ada",\n  "nickname": null\n}');
-  assert.equal(dataGridRowDetailTsv(detail), "1\tAda\tNULL");
+  assert.equal(dataGridRowDetailJson(detail, { id: 1, profile: { city: "Shanghai" } }), '{\n  "id": 1,\n  "profile": {\n    "city": "Shanghai"\n  }\n}');
+  assert.equal(dataGridRowDetailTsv(detail), "1\tAda\t");
 });
 
+test("data grid detail copy renders textual and GBK-decodable MySQL VARBINARY as text", () => {
+  const rowDetail = buildDataGridRowDetail({
+    rowIndex: 0,
+    rowId: 1,
+    row: ["0x616263", "0xdeadbeef"],
+    columns: ["name", "payload"],
+    columnIndexes: [0, 1],
+    resultColumnTypes: ["varbinary(128)", "varbinary(4)"],
+    displayValue: (value) => String(value),
+  });
+  const columnDetail = buildDataGridColumnDetail({
+    rows: [{ rowIndex: 0, rowId: 1, row: ["0x616263"] }],
+    columns: ["name"],
+    columnIndex: 0,
+    resultColumnTypes: ["varbinary(128)"],
+    displayValue: (value) => String(value),
+  });
+
+  // 0xdeadbeef 恰好全部组成合法 GBK 序列：MySQL 连接按 GBK 解码复制（与网格显示一致），见 binaryCellDownload.test.ts。
+  assert.equal(dataGridRowDetailJson(rowDetail, undefined, "mysql"), '{\n  "name": "abc",\n  "payload": "蕲撅"\n}');
+  assert.equal(dataGridRowDetailTsv(rowDetail, "mysql"), "abc\t蕲撅");
+  assert.equal(dataGridColumnDetailJson(columnDetail!, "mysql"), '[\n  {\n    "row": 1,\n    "value": "abc"\n  }\n]');
+  assert.equal(dataGridColumnDetailTsv(columnDetail!, "mysql"), "abc");
+  // 非 MySQL binary 及非文本 VARBINARY 不应被误转成字符串或 replacement character。
+  assert.equal(dataGridRowDetailJson(rowDetail), '{\n  "name": "0x616263",\n  "payload": "0xdeadbeef"\n}');
+});
+
+test("dataGridRowDetailJson uses the original MongoDB document for nested values", () => {
+  const document = {
+    _id: { $oid: "507f1f77bcf86cd799439011" },
+    profile: { createdAt: { $date: "2025-01-02T03:04:05.000Z" }, labels: ["vip"] },
+  };
+  const detail = buildDataGridRowDetail({
+    rowIndex: 0,
+    rowId: 1,
+    row: ['{"$oid":"507f1f77bcf86cd799439011"}', '{"createdAt":{"$date":"2025-01-02T03:04:05.000Z"},"labels":["vip"]}'],
+    columns: ["_id", "profile"],
+    columnIndexes: [0, 1],
+    displayValue: (value) => String(value),
+  });
+
+  assert.equal(dataGridRowDetailJson(detail, document), JSON.stringify(document, null, 2));
+  assert.doesNotMatch(dataGridRowDetailJson(detail, document), /\\"\\$oid\\"/);
+});
+
+test("jsonDetailDisplayValue expands JSON stored in MongoDB string fields", () => {
+  assert.deepEqual(jsonDetailDisplayValue({ imparts: '{"insImpart":[{"impartId":"40-936","impartAnswer":"N,,"}]}' }), { imparts: { insImpart: [{ impartId: "40-936", impartAnswer: "N,," }] } });
+});
 test("buildDataGridColumnDetail maps a whole column across rows", () => {
   const typeByColumn = new Map([["name", "varchar"]]);
   const commentByColumn = new Map([["name", "display name"]]);
@@ -206,7 +360,7 @@ test("dataGridColumnDetailJson and dataGridColumnDetailTsv format copy payloads"
 
   assert.ok(detail);
   assert.equal(dataGridColumnDetailJson(detail), '[\n  {\n    "row": 1,\n    "value": "Ada"\n  },\n  {\n    "row": 2,\n    "value": null\n  }\n]');
-  assert.equal(dataGridColumnDetailTsv(detail), "Ada\nNULL");
+  assert.equal(dataGridColumnDetailTsv(detail), "Ada\n");
 });
 
 const detailFields: DataGridCellDetail[] = [

@@ -1,6 +1,6 @@
 import { test } from "vitest";
 import assert from "node:assert/strict";
-import { buildGroupedObjectTreeNodes, buildObjectGroupPlaceholderNodes, buildSimpleObjectTreeNodes, buildTableTreeNodes, mergeTableInfosIntoObjects, mergeTableTreePageChildren } from "../../apps/desktop/src/lib/tableTree.ts";
+import { buildGroupedObjectTreeNodes, buildObjectGroupPlaceholderNodes, buildSimpleObjectTreeNodes, buildTableTreeNodes, filterSimpleSidebarSupplementalObjects, mergeTableInfosIntoObjects, mergeTableTreePageChildren } from "../../apps/desktop/src/lib/table/tableTree.ts";
 import type { ObjectInfo, TableInfo, TreeNode } from "../../apps/desktop/src/types/database.ts";
 
 function table(name: string, parent?: string): TableInfo {
@@ -10,6 +10,16 @@ function table(name: string, parent?: string): TableInfo {
     comment: null,
     parent_schema: parent ? "public" : null,
     parent_name: parent ?? null,
+  };
+}
+
+function view(name: string): TableInfo {
+  return {
+    name,
+    table_type: "VIEW",
+    comment: null,
+    parent_schema: null,
+    parent_name: null,
   };
 }
 
@@ -105,6 +115,33 @@ test("mergeTableTreePageChildren attaches later page partitions to loaded parent
   );
 });
 
+test("mergeTableTreePageChildren dedupes non-table nodes repeated across pages", () => {
+  // Simple-display pagination: a later page can re-return an object the
+  // current children already hold (Dameng agent falls back between metadata
+  // queries, so page boundaries drift). Non-table nodes (views) must not be
+  // inserted twice — duplicate ids break the sidebar scroller's key-field.
+  const firstPage = buildTableTreeNodes({
+    nodeId: "conn:app:public",
+    connectionId: "conn",
+    database: "app",
+    schema: "public",
+    tables: [table("orders"), view("orders_v")],
+  });
+  const driftedPage = buildTableTreeNodes({
+    nodeId: "conn:app:public",
+    connectionId: "conn",
+    database: "app",
+    schema: "public",
+    tables: [view("orders_v"), table("payments")],
+  });
+
+  const merged = mergeTableTreePageChildren(firstPage, driftedPage, "conn", "app");
+  const ids = merged.map((node) => node.id);
+  assert.equal(new Set(ids).size, ids.length, "merged children must not contain duplicate ids");
+  assert.equal(merged.filter((node) => node.type === "view").length, 1, "the repeated view must appear once");
+  assert.deepEqual(merged.map((node) => node.label).sort(), ["orders", "orders_v", "payments"].sort());
+});
+
 test("buildTableTreeNodes keeps sidebar tables in natural name order", () => {
   const nodes = buildTableTreeNodes({
     nodeId: "conn:app:public",
@@ -188,10 +225,39 @@ test("buildGroupedObjectTreeNodes groups Oracle packages and package bodies", ()
   assert.equal(packageGroup?.label, "tree.packages");
   assert.deepEqual(
     packageGroup?.children?.map((node) => ({ label: node.label, type: node.type, id: node.id })),
-    [
-      { label: "PAYROLL", type: "package", id: "conn:app:HR:__packages:HR:PAYROLL:PACKAGE" },
-      { label: "PAYROLL", type: "package-body", id: "conn:app:HR:__packages:HR:PAYROLL:PACKAGE_BODY" },
+    [{ label: "PAYROLL", type: "package", id: "conn:app:HR:__packages:HR:PAYROLL:PACKAGE" }],
+  );
+
+  // #13239: the body lives in its own group so picking it cannot open the spec.
+  const bodyGroup = groups.find((node) => node.type === "group-package-bodies");
+  assert.equal(bodyGroup?.label, "tree.packageBodies");
+  assert.deepEqual(
+    bodyGroup?.children?.map((node) => ({ label: node.label, type: node.type, id: node.id })),
+    [{ label: "PAYROLL", type: "package-body", id: "conn:app:HR:__package_bodies:HR:PAYROLL:PACKAGE_BODY" }],
+  );
+});
+
+test("buildGroupedObjectTreeNodes groups materialized views separately from views", () => {
+  const groups = buildGroupedObjectTreeNodes({
+    nodeId: "conn:app:APP",
+    connectionId: "conn",
+    database: "app",
+    schema: "APP",
+    objects: [
+      { name: "ACTIVE_USERS", object_type: "VIEW", schema: "APP" },
+      { name: "USER_SUMMARY_MV", object_type: "MATERIALIZED_VIEW", schema: "APP" },
     ],
+  });
+
+  const viewGroup = groups.find((node) => node.type === "group-views");
+  const materializedViewGroup = groups.find((node) => node.type === "group-materialized-views");
+  assert.deepEqual(
+    viewGroup?.children?.map((node) => ({ label: node.label, type: node.type })),
+    [{ label: "ACTIVE_USERS", type: "view" }],
+  );
+  assert.deepEqual(
+    materializedViewGroup?.children?.map((node) => ({ label: node.label, type: node.type })),
+    [{ label: "USER_SUMMARY_MV", type: "materialized_view" }],
   );
 });
 
@@ -268,6 +334,32 @@ test("mergeTableInfosIntoObjects restores views missing from object metadata", (
     [
       { name: "orders", type: "TABLE", schema: "public", comment: null },
       { name: "active_orders", type: "VIEW", schema: "public", comment: "current orders" },
+    ],
+  );
+});
+
+test("filterSimpleSidebarSupplementalObjects leaves paged tables and views to listTables", () => {
+  const supplemental = filterSimpleSidebarSupplementalObjects([
+    { name: "orders", object_type: "TABLE", schema: "public" },
+    { name: "active_orders", object_type: "VIEW", schema: "public" },
+    { name: "order_summary", object_type: "MATERIALIZED VIEW", schema: "public" },
+    { name: "refresh_stats", object_type: "PROCEDURE", schema: "public" },
+    { name: "total_due", object_type: "FUNCTION", schema: "public" },
+  ]);
+  const nodes = buildSimpleObjectTreeNodes({
+    nodeId: "conn:app:public",
+    connectionId: "conn",
+    database: "app",
+    schema: "public",
+    objects: mergeTableInfosIntoObjects(supplemental, [table("orders")], "public"),
+  });
+
+  assert.deepEqual(
+    nodes.map((node) => ({ label: node.label, type: node.type })),
+    [
+      { label: "orders", type: "table" },
+      { label: "refresh_stats", type: "procedure" },
+      { label: "total_due", type: "function" },
     ],
   );
 });

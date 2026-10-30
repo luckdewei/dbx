@@ -5,15 +5,28 @@ import {
   activeResultRun,
   databaseDisplayNameForTab,
   executionSummaryItems,
+  middleEllipsis,
   nextExecutionSummaryView,
   resultGridCacheKey,
+  resultGridColumnWidthCacheKey,
   resultRunItems,
+  resultSourceRange,
+  resultSqlForGrid,
   tabDisplayTitle,
   tabModeLabel,
   tabularResultItems,
-} from "../../apps/desktop/src/lib/tabPresentation.ts";
+} from "../../apps/desktop/src/lib/tabs/tabPresentation.ts";
+import i18n, { setLocale } from "../../apps/desktop/src/i18n/index.ts";
+import { restoreOpenTabsState } from "../../apps/desktop/src/lib/app/openTabsPersistence.ts";
 import { useConnectionStore } from "../../apps/desktop/src/stores/connectionStore.ts";
+import { useSettingsStore } from "../../apps/desktop/src/stores/settingsStore.ts";
 import type { ConnectionConfig, QueryResult, QueryTab } from "../../apps/desktop/src/types/database.ts";
+
+function activateTestPinia() {
+  setActivePinia(createPinia());
+  // Keep legacy title assertions explicit now that compact titles are the default.
+  useSettingsStore().editorSettings.compactTabTitle = false;
+}
 
 function installMemoryStorage() {
   const values = new Map<string, string>();
@@ -58,18 +71,19 @@ function queryTab(overrides: Partial<QueryTab> = {}): QueryTab {
   };
 }
 
-function result(columns: string[]): QueryResult {
+function result(columns: string[], overrides: Partial<QueryResult> = {}): QueryResult {
   return {
     columns,
     rows: [],
     affected_rows: 0,
     execution_time_ms: 1,
+    ...overrides,
   };
 }
 
 test("query tab display title uses custom title when present", () => {
   const restoreStorage = installMemoryStorage();
-  setActivePinia(createPinia());
+  activateTestPinia();
   useConnectionStore().addEphemeralConnection(conn("conn-1"));
   const t = (key: string) => key;
 
@@ -81,9 +95,44 @@ test("query tab display title uses custom title when present", () => {
   }
 });
 
+test("restored MQTT tab titles ignore legacy persisted text and follow the current locale", async () => {
+  const restoreStorage = installMemoryStorage();
+  activateTestPinia();
+  useConnectionStore().addEphemeralConnection({
+    ...conn("conn-1"),
+    name: "test-mqtt",
+    db_type: "mqtt",
+    port: 1883,
+  });
+  const restored = restoreOpenTabsState(
+    JSON.stringify([
+      queryTab({
+        title: "test-mqtt Console",
+        database: "",
+        mode: "mqtt",
+      }),
+    ]),
+    "tab-1",
+    { validConnectionIds: ["conn-1"] },
+  );
+  const tab = restored.tabs[0];
+  const translate = (key: string) => i18n.global.t(key);
+
+  try {
+    assert.ok(tab);
+    await setLocale("en");
+    assert.equal(tabDisplayTitle(tab, translate), "test-mqtt - MQTT Console");
+    await setLocale("zh-CN");
+    assert.equal(tabDisplayTitle(tab, translate), "test-mqtt - MQTT 控制台");
+  } finally {
+    await setLocale("en");
+    restoreStorage();
+  }
+});
+
 test("jdbc tabs use the connection target when database is empty", () => {
   const restoreStorage = installMemoryStorage();
-  setActivePinia(createPinia());
+  activateTestPinia();
   useConnectionStore().addEphemeralConnection({
     ...conn("conn-1"),
     db_type: "jdbc",
@@ -116,7 +165,7 @@ test("jdbc tabs use the connection target when database is empty", () => {
 
 test("zookeeper tabs use key browser labels", () => {
   const restoreStorage = installMemoryStorage();
-  setActivePinia(createPinia());
+  activateTestPinia();
   useConnectionStore().addEphemeralConnection({
     ...conn("conn-1"),
     name: "ZK Prod",
@@ -129,6 +178,65 @@ test("zookeeper tabs use key browser labels", () => {
     const tab = queryTab({ mode: "zookeeper", database: "", title: "ZooKeeper Keys" });
     assert.equal(tabDisplayTitle(tab, t), "ZK Prod@keys");
     assert.equal(tabModeLabel(tab, t), "ZooKeeper");
+  } finally {
+    restoreStorage();
+  }
+});
+
+test("HBase tabs identify the table and namespace", () => {
+  const restoreStorage = installMemoryStorage();
+  activateTestPinia();
+  useConnectionStore().addEphemeralConnection({
+    ...conn("conn-1"),
+    name: "HBase Dev",
+    db_type: "hbase",
+    port: 8080,
+  });
+  const t = (key: string) => key;
+
+  try {
+    const tab = queryTab({ mode: "hbase", database: "analytics", title: "events", sql: "events" });
+    assert.equal(tabDisplayTitle(tab, t), "events@analytics");
+    assert.equal(tabModeLabel(tab, t), "HBase");
+  } finally {
+    restoreStorage();
+  }
+});
+
+test("GridFS tabs use dedicated titles and labels", () => {
+  const restoreStorage = installMemoryStorage();
+  activateTestPinia();
+  useConnectionStore().addEphemeralConnection({
+    ...conn("conn-1"),
+    name: "uat-mongo",
+    db_type: "mongodb",
+    port: 27017,
+  });
+  const t = (key: string) => {
+    if (key === "tabs.gridfs") return "GridFS";
+    if (key === "tabs.mongo") return "Mongo";
+    return key;
+  };
+
+  try {
+    const managerTab = queryTab({
+      title: "GridFS",
+      database: "amazon",
+      mode: "mongo-gridfs" as QueryTab["mode"],
+      sql: "",
+    });
+    const bucketTab = queryTab({
+      title: "amazon.NMDocumentData_acc001",
+      database: "amazon",
+      mode: "mongo-bucket",
+      sql: "NMDocumentData_acc001",
+      mongoBucket: { bucketName: "NMDocumentData_acc001" },
+    });
+
+    assert.equal(tabDisplayTitle(managerTab, t), "GridFS@amazon");
+    assert.equal(tabDisplayTitle(bucketTab, t), "NMDocumentData_acc001@amazon");
+    assert.equal(tabModeLabel(managerTab, t), "GridFS");
+    assert.equal(tabModeLabel(bucketTab, t), "GridFS");
   } finally {
     restoreStorage();
   }
@@ -148,6 +256,72 @@ test("tabular result items hide statement results without returned columns", () 
   assert.deepEqual(tabularResultItems(undefined), []);
 });
 
+test("tabular result items expose source labels when available", () => {
+  const results = [result([]), result(["id"], { sourceLabel: "public.users", sourceStatement: "select * from public.users" }), result(["name"], { sourceStatement: "select id, name, email, created_at from users where active = true order by created_at desc" })];
+
+  assert.deepEqual(
+    tabularResultItems(results).map((item) => ({ index: item.index, n: item.n, label: item.label, title: item.title })),
+    [
+      { index: 1, n: 1, label: "public.users", title: "public.users" },
+      { index: 2, n: 2, label: undefined, title: "select id, name, email, created_at from users where active = true order by created_at desc" },
+    ],
+  );
+  assert.deepEqual(
+    tabularResultItems([result(["id"], { sourceLabel: "db.users" })]).map((item) => item.label),
+    ["db.users"],
+  );
+});
+
+test("middleEllipsis preserves the beginning and end of long source labels", () => {
+  assert.equal(middleEllipsis("easy_manager_tool.tool_monitor_data_index_item"), "easy_manage...index_item");
+  assert.equal(middleEllipsis("aaa.apis"), "aaa.apis");
+});
+
+test("resultSourceRange uses the result index for repeated SQL", () => {
+  const sql = "select * from users;\nselect * from users;";
+  assert.deepEqual(resultSourceRange(sql, { sourceStatement: "select * from users" }, 1, "mysql"), {
+    from: sql.lastIndexOf("select"),
+    to: sql.length - 1,
+    sql: "select * from users",
+  });
+  assert.equal(resultSourceRange("select * from users;", { sourceStatement: "select * from orders" }, 0, "mysql"), undefined);
+});
+
+test("resultSourceRange resolves newline-separated MongoDB commands", () => {
+  const sql = "db.model_field_group.find({})\n\ndb.model_info.find({})";
+  const sourceStatement = "db.model_info.find({})";
+
+  assert.deepEqual(resultSourceRange(sql, { sourceStatement }, 1, "mongodb"), {
+    from: sql.indexOf(sourceStatement),
+    to: sql.length,
+    sql: sourceStatement,
+  });
+});
+
+test("resultSourceRange resolves newline-separated Redis commands", () => {
+  const sql = "GET first\n\nGET second";
+  const sourceStatement = "GET second";
+
+  assert.deepEqual(resultSourceRange(sql, { sourceStatement }, 1, "redis"), {
+    from: sql.indexOf(sourceStatement),
+    to: sql.length,
+    sql: sourceStatement,
+  });
+});
+
+test("resultSqlForGrid prefers the active result source statement", () => {
+  const tab = queryTab({
+    sql: "select * from users; select * from orders",
+    lastExecutedSql: "select * from users; select * from orders",
+    resultBaseSql: "select * from users; select * from orders",
+    result: result(["id"], { sourceStatement: "select * from orders" }),
+  });
+
+  assert.equal(resultSqlForGrid(tab), "select * from orders");
+  assert.equal(resultSqlForGrid(queryTab({ sql: "select 1", resultBaseSql: "select 2" })), "select 2");
+  assert.equal(resultSqlForGrid(queryTab({ sql: "select 1", lastExecutedSql: "select 3" })), "select 3");
+});
+
 test("result run items expose ordered labels and active state", () => {
   const tab = queryTab({
     activeResultRunId: "run-2",
@@ -158,6 +332,7 @@ test("result run items expose ordered labels and active state", () => {
         sequence: 1,
         sql: "select 1",
         createdAt: 10,
+        pinned: true,
         result: result(["one"]),
       },
       {
@@ -172,11 +347,14 @@ test("result run items expose ordered labels and active state", () => {
   });
 
   assert.deepEqual(resultRunItems(tab), [
-    { id: "run-1", title: "Run 1", sequence: 1, active: false },
-    { id: "run-2", title: "Run 2", sequence: 2, active: true },
+    { id: "run-1", title: "", sequence: 1, active: false, pinned: true, sourceLabel: undefined },
+    { id: "run-2", title: "", sequence: 2, active: true, pinned: false, sourceLabel: undefined },
   ]);
   assert.equal(activeResultRun(tab)?.id, "run-2");
-  assert.deepEqual(resultRunItems(queryTab()).map((item) => item.title), []);
+  assert.deepEqual(
+    resultRunItems(queryTab()).map((item) => item.title),
+    [],
+  );
 });
 
 test("result grid cache key includes result run id and statement result index", () => {
@@ -186,9 +364,18 @@ test("result grid cache key includes result run id and statement result index", 
   assert.equal(resultGridCacheKey(queryTab({ activeResultIndex: undefined })), "tab-1-current-0");
 });
 
+test("result grid column width cache key ignores result run id and isolates result indexes", () => {
+  const first = queryTab({ activeResultRunId: "run-1", activeResultIndex: 2 });
+  const rerun = queryTab({ activeResultRunId: "run-2", activeResultIndex: 2 });
+
+  assert.equal(resultGridColumnWidthCacheKey(first), "result-column-width-tab-1-2");
+  assert.equal(resultGridColumnWidthCacheKey(rerun), resultGridColumnWidthCacheKey(first));
+  assert.notEqual(resultGridColumnWidthCacheKey(queryTab({ activeResultIndex: 1 })), resultGridColumnWidthCacheKey(first));
+});
+
 test("execution summary items include table and non-table statement results", () => {
   const items = executionSummaryItems({
-    results: [result([]), result(["id"]), { ...result(["Error"]), rows: [["boom"]] }],
+    results: [result([], { affected_rows: 4 }), result(["id"], { rows: [[1], [2], [3]] }), { ...result(["Error"]), rows: [["boom"]], execution_error: true }],
   });
 
   assert.deepEqual(
@@ -197,12 +384,43 @@ test("execution summary items include table and non-table statement results", ()
       hasTabularResult: item.hasTabularResult,
       returnedColumns: item.returnedColumns,
       returnedRows: item.returnedRows,
+      rowCount: item.rowCount,
       isError: item.isError,
     })),
     [
-      { index: 0, hasTabularResult: false, returnedColumns: 0, returnedRows: 0, isError: false },
-      { index: 1, hasTabularResult: true, returnedColumns: 1, returnedRows: 0, isError: false },
-      { index: 2, hasTabularResult: true, returnedColumns: 1, returnedRows: 1, isError: true },
+      { index: 0, hasTabularResult: false, returnedColumns: 0, returnedRows: 0, rowCount: 4, isError: false },
+      { index: 1, hasTabularResult: true, returnedColumns: 1, returnedRows: 3, rowCount: 3, isError: false },
+      { index: 2, hasTabularResult: true, returnedColumns: 1, returnedRows: 1, rowCount: 1, isError: true },
+    ],
+  );
+});
+
+test("execution summary items preserve live statuses and unexecuted statements", () => {
+  const sql = "INSERT 1;\nINSERT 2;\nINSERT 3";
+  const items = executionSummaryItems({
+    batchSqlExecution: {
+      executionId: "run-1",
+      submittedSql: sql,
+      editorFingerprint: "fingerprint",
+      sourceOffset: 0,
+      completed: 2,
+      total: 3,
+      startedAt: 1,
+      finishedAt: 2,
+      items: [
+        { statementIndex: 0, sql: "INSERT 1", from: 0, to: 8, status: "success", affectedRows: 1, executionTimeMs: 3 },
+        { statementIndex: 1, sql: "INSERT 2", from: 10, to: 18, status: "error", error: "duplicate", executionTimeMs: 2 },
+        { statementIndex: 2, sql: "INSERT 3", from: 20, to: 28, status: "skipped" },
+      ],
+    },
+  });
+
+  assert.deepEqual(
+    items.map(({ statementIndex, status, affectedRows, error }) => ({ statementIndex, status, affectedRows, error })),
+    [
+      { statementIndex: 0, status: "success", affectedRows: 1, error: undefined },
+      { statementIndex: 1, status: "error", affectedRows: 0, error: "duplicate" },
+      { statementIndex: 2, status: "skipped", affectedRows: 0, error: undefined },
     ],
   );
 });

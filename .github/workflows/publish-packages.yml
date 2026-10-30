@@ -6,6 +6,11 @@ on:
       tag:
         description: "Release tag (e.g. v0.3.10)"
         required: true
+      notify:
+        description: "Send release notification"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write
@@ -20,6 +25,9 @@ jobs:
     name: Publish to Homebrew & Scoop
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
       - name: Extract version from tag
         id: version
         run: |
@@ -42,7 +50,7 @@ jobs:
           TAG="${{ steps.version.outputs.tag }}"
 
           ASSETS=(
-            "${PRODUCT_NAME}_${VERSION}_aarch64.dmg"
+            "${PRODUCT_NAME}_${VERSION}_arm64.dmg"
             "${PRODUCT_NAME}_${VERSION}_x64.dmg"
             "${PRODUCT_NAME}_${VERSION}_x64-setup.exe"
             "${PRODUCT_NAME}_${VERSION}_arm64-setup.exe"
@@ -78,7 +86,7 @@ jobs:
           }
 
           echo "SHA256 hashes:"
-          compute_hash "artifacts/${PRODUCT_NAME}_${VERSION}_aarch64.dmg" "sha_dmg_arm64"
+          compute_hash "artifacts/${PRODUCT_NAME}_${VERSION}_arm64.dmg" "sha_dmg_arm64"
           compute_hash "artifacts/${PRODUCT_NAME}_${VERSION}_x64.dmg" "sha_dmg_x64"
           compute_hash "artifacts/${PRODUCT_NAME}_${VERSION}_x64-setup.exe" "sha_exe_x64"
           compute_hash "artifacts/${PRODUCT_NAME}_${VERSION}_arm64-setup.exe" "sha_exe_arm64"
@@ -86,10 +94,16 @@ jobs:
       - name: Publish Homebrew Cask
         env:
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           SHA_ARM64="${{ steps.hashes.outputs.sha_dmg_arm64 }}"
           SHA_X64="${{ steps.hashes.outputs.sha_dmg_x64 }}"
+
+          MCP_VERSION="$(curl -fsSL https://registry.npmjs.org/@dbx-app/mcp-server/latest | jq -er '.version')"
+          [[ "$MCP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          gh release download "packages-v${MCP_VERSION}" --repo "${GITHUB_REPOSITORY}" \
+            --pattern SHA256SUMS --dir artifacts --clobber
 
           git clone --depth 1 \
             "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/${REPO_OWNER}/homebrew-tap.git" \
@@ -99,14 +113,13 @@ jobs:
 
           cat > Casks/dbx.rb <<'RUBY_EOF'
           cask "dbx" do
-            arch arm: "aarch64", intel: "x64"
+            arch arm: "arm64", intel: "x64"
 
             version "__VERSION__"
             sha256 arm:   "__SHA_ARM64__",
                    intel: "__SHA_X64__"
 
-            url "https://github.com/__OWNER__/__APP__/releases/download/v#{version}/__PRODUCT___#{version}_#{arch}.dmg",
-                verified: "github.com/__OWNER__/__APP__/"
+            url "https://github.com/__OWNER__/__APP__/releases/download/v#{version}/__PRODUCT___#{version}_#{arch}.dmg"
             name "DBX"
             desc "Database management tool"
             homepage "https://dbxio.com/"
@@ -133,9 +146,13 @@ jobs:
           sed -i "s/__SHA_ARM64__/${SHA_ARM64}/g" Casks/dbx.rb
           sed -i "s/__SHA_X64__/${SHA_X64}/g" Casks/dbx.rb
 
+          mkdir -p Formula
+          node "$GITHUB_WORKSPACE/.github/scripts/render-mcp-formula.mjs" \
+            "${MCP_VERSION}" "$GITHUB_WORKSPACE/artifacts/SHA256SUMS" Formula/dbx-mcp.rb
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Casks/dbx.rb
+          git add Casks/dbx.rb Formula/dbx-mcp.rb
 
           if git diff --cached --quiet; then
             echo "Homebrew Cask is already up to date."
@@ -234,6 +251,26 @@ jobs:
             --clobber
           ls -lh assets/
 
+      - name: Validate latest.json completeness
+        run: |
+          LATEST_JSON="assets/latest.json"
+          if [ ! -f "$LATEST_JSON" ]; then
+            echo "::error::latest.json not found in release assets; refusing to sync an incomplete manifest to R2"
+            exit 1
+          fi
+          MISSING=""
+          for p in darwin-aarch64 darwin-x86_64 windows-x86_64 windows-aarch64 linux-x86_64 linux-aarch64; do
+            if ! jq -e --arg p "$p" '.platforms[$p] != null' "$LATEST_JSON" >/dev/null; then
+              MISSING="${MISSING} ${p}"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::latest.json is missing updater platforms:${MISSING}. Release builds may still be uploading assets; dispatch again after all release jobs finish."
+            exit 1
+          fi
+          echo "Platform manifest complete:"
+          jq -r '.platforms | keys[]' "$LATEST_JSON"
+
       - name: Rewrite latest.json download URLs to R2 CDN
         run: |
           TAG="${{ steps.version.outputs.tag }}"
@@ -272,6 +309,67 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
 
+      - name: Keep latest five versioned releases in R2
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          CURRENT_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t keep_tags < <(
+            gh release list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --limit 100 \
+              --json tagName,isDraft,publishedAt \
+              | jq -r '[.[] | select(.isDraft == false and (.tagName | test("^v[0-9]+[.][0-9]+[.][0-9]+([.-][0-9A-Za-z.-]+)?$")))] | sort_by(.publishedAt) | reverse | .[:5] | .[].tagName'
+          )
+
+          # Skip cleanup if release metadata is incomplete so publishing can never delete the wrong versions.
+          if [ "${#keep_tags[@]}" -lt 5 ]; then
+            echo "::warning::Found only ${#keep_tags[@]} published releases; skipping R2 cleanup."
+            exit 0
+          fi
+
+          is_kept_release() {
+            local candidate="$1"
+            printf '%s\n' "${keep_tags[@]}" | grep -Fxq -- "${candidate}"
+          }
+
+          if ! is_kept_release "${CURRENT_TAG}"; then
+            echo "::warning::Current release ${CURRENT_TAG} is not among the latest five releases; skipping R2 cleanup."
+            exit 0
+          fi
+
+          echo "Keeping R2 releases: ${keep_tags[*]}"
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          mapfile -t stored_tags < <(
+            aws s3api list-objects-v2 \
+              --bucket "${R2_BUCKET_NAME}" \
+              --prefix "releases/" \
+              --delimiter "/" \
+              --endpoint-url "${endpoint}" \
+              --query 'CommonPrefixes[].Prefix' \
+              --output text \
+              | tr '\t' '\n' \
+              | sed -nE 's#^releases/(v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?)/$#\1#p'
+          )
+
+          for tag in "${stored_tags[@]}"; do
+            if is_kept_release "${tag}"; then
+              continue
+            fi
+
+            echo "Removing old R2 release: ${tag}"
+            aws s3 rm "s3://${R2_BUCKET_NAME}/releases/${tag}/" \
+              --recursive \
+              --endpoint-url "${endpoint}"
+          done
+
       - name: Purge Cloudflare cache
         run: |
           set -euo pipefail
@@ -304,6 +402,9 @@ jobs:
     needs: [publish, upload-r2]
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
       - name: Promote prerelease to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -315,9 +416,29 @@ jobs:
             --latest
           echo "::notice::Release ${TAG} promoted from prerelease to latest release"
 
+      - name: Promote CNB prerelease to release
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/github-release"
+          gh release view "$TAG" \
+            --repo "${{ github.repository }}" \
+            --json tagName,name,body,targetCommitish,isPrerelease,isDraft \
+            > "$RUNNER_TEMP/github-release/release.json"
+
+          # Sync metadata only so promoting a release never re-uploads large CNB assets.
+          node .github/scripts/sync-cnb-release.mjs \
+            --github-release "$RUNNER_TEMP/github-release/release.json" \
+            --metadata-only \
+            --make-latest
+
   notify-qq:
     name: QQ Notify
     needs: [promote-release]
+    if: ${{ inputs.notify }}
     runs-on: ubuntu-latest
     steps:
       - name: Build message
@@ -363,6 +484,7 @@ jobs:
           PYEOF
 
       - name: Send to QQ group
+        continue-on-error: true
         env:
           SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           HOST: ${{ secrets.DEPLOY_HOST }}
@@ -380,3 +502,22 @@ jobs:
             -H 'Authorization: Bearer ${ASTRBOT_API_KEY}' \
             -H 'Content-Type: application/json' \
             --data-binary @-"
+
+  notify-feishu:
+    name: Notify Feishu group
+    needs: [promote-release]
+    if: ${{ inputs.notify }}
+    # Card sends after promotion so the title reflects the formal release.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Send release card to Feishu
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_CHAT_ID: ${{ secrets.FEISHU_CHAT_ID }}
+        run: python3 scripts/notify_feishu.py "${{ github.event.inputs.tag }}"

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { rankSavedSqlHistory, savedSqlHistoryScore, savedSqlMatchesHistoryScope } from "../../apps/desktop/src/lib/savedSqlHistory.ts";
+import { rankSavedSqlHistory, savedSqlHistoryScore, savedSqlMatchesHistoryScope } from "../../apps/desktop/src/lib/savedSql/savedSqlHistory.ts";
 import type { SavedSqlFile } from "../../apps/desktop/src/types/database.ts";
 
 function file(input: Partial<SavedSqlFile> & Pick<SavedSqlFile, "id" | "name" | "connectionId" | "database">): SavedSqlFile {
@@ -25,6 +25,16 @@ test("SQL 库历史按连接和数据库过滤", () => {
     ["a"],
   );
   assert.equal(savedSqlMatchesHistoryScope(files[2], { connectionId: "conn-1" }), false);
+});
+
+test("SQL 库历史不会混入同名数据库的其他 catalog", () => {
+  const files = [
+    file({ id: "default", name: "default.sql", connectionId: "conn-1", database: "app" }),
+    file({ id: "hive", name: "hive.sql", connectionId: "conn-1", catalog: "hive", database: "app" }),
+  ];
+
+  assert.deepEqual(rankSavedSqlHistory(files, { connectionId: "conn-1", catalog: null, database: "app" }).map((item) => item.id), ["default"]);
+  assert.deepEqual(rankSavedSqlHistory(files, { connectionId: "conn-1", catalog: "hive", database: "app" }).map((item) => item.id), ["hive"]);
 });
 
 test("SQL 库历史综合打开次数和最近打开时间排序", () => {

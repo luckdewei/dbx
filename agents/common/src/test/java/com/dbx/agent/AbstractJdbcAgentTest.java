@@ -14,7 +14,9 @@ import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Map;
 import java.util.List;
+import java.util.Properties;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -24,6 +26,19 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class AbstractJdbcAgentTest {
+    @Test
+    void buildsStandardJdbcCredentialPropertiesByDefault() {
+        TestAgent agent = new TestAgent(new TrackingConnection());
+
+        Properties properties = agent.buildConnectionProperties(
+            new ConnectParams("localhost", 0, "demo", "user", "secret", "", "", false)
+        );
+
+        assertEquals("user", properties.getProperty("user"));
+        assertEquals("secret", properties.getProperty("password"));
+        assertEquals(2, properties.size());
+    }
+
     @Test
     void ownsConnectionLifecycleAndConnectedState() {
         TrackingConnection tracking = new TrackingConnection();
@@ -42,6 +57,111 @@ class AbstractJdbcAgentTest {
 
         assertNull(agent.getConnection());
         assertEquals(1, tracking.closeCount);
+        assertEquals(1, agent.afterDisconnectCount);
+    }
+
+    @Test
+    void resolvesAndCachesGaussdbCompatibilityIdentifierQuotes() {
+        for (String mode : Arrays.asList("M", "B", "MYSQL")) {
+            TrackingConnection tracking = new TrackingConnection();
+            tracking.compatibilityMode = mode;
+            tracking.identifierQuote = "\"";
+            TestAgent agent = new TestAgent(tracking);
+
+            agent.connect(postgresCompatibleParams());
+
+            assertEquals("`", agent.getIdentifierQuote());
+            assertEquals("`", agent.getIdentifierQuote());
+            assertEquals(1, tracking.compatibilityQueryCount);
+        }
+
+        for (String mode : Arrays.asList("A", "PG", "ORA", "POSTGRESQL")) {
+            TrackingConnection tracking = new TrackingConnection();
+            tracking.compatibilityMode = mode;
+            tracking.identifierQuote = "`";
+            TestAgent agent = new TestAgent(tracking);
+
+            agent.connect(postgresCompatibleParams());
+
+            assertEquals("\"", agent.getIdentifierQuote());
+            assertEquals(1, tracking.compatibilityQueryCount);
+        }
+    }
+
+    @Test
+    void fallsBackToJdbcMetadataWhenCompatibilityQueryFails() {
+        TrackingConnection tracking = new TrackingConnection();
+        tracking.compatibilityQueryFails = true;
+        tracking.identifierQuote = "`";
+        TestAgent agent = new TestAgent(tracking);
+
+        agent.connect(postgresCompatibleParams());
+
+        assertEquals("`", agent.getIdentifierQuote());
+        assertEquals(1, tracking.compatibilityQueryCount);
+    }
+
+    @Test
+    void skipsCompatibilityQueryForOtherJdbcFamilies() {
+        TrackingConnection tracking = new TrackingConnection();
+        tracking.identifierQuote = "`";
+        TestAgent agent = new TestAgent(tracking);
+
+        ConnectParams params = new ConnectParams();
+        params.setConnection_string("jdbc:mysql://localhost/test");
+        agent.connect(params);
+
+        assertEquals("`", agent.getIdentifierQuote());
+        assertEquals(0, tracking.compatibilityQueryCount);
+    }
+
+    @Test
+    void ignoresGbase8sDriverBacktickIdentifierQuote() {
+        TrackingConnection tracking = new TrackingConnection();
+        tracking.identifierQuote = "`";
+        tracking.jdbcUrl = "jdbc:gbasedbt-sqli://localhost:9088/appdb:GBASEDBTSERVER=gbase8s";
+        TestAgent agent = new TestAgent(tracking);
+
+        agent.connect(new ConnectParams());
+
+        assertEquals("", agent.getIdentifierQuote());
+    }
+
+    @Test
+    void ignoresBacktickQuoteForInformixFamilyConnectionString() {
+        TrackingConnection tracking = new TrackingConnection();
+        tracking.identifierQuote = "`";
+        TestAgent agent = new TestAgent(tracking);
+
+        ConnectParams params = new ConnectParams();
+        params.setConnection_string("jdbc:informix-sqli://localhost:9088/appdb:INFORMIXSERVER=ol_informix");
+        agent.connect(params);
+
+        assertEquals("", agent.getIdentifierQuote());
+    }
+
+    @Test
+    void keepsInformixFamilyBacktickQuoteInMysqlCompatMode() {
+        TrackingConnection tracking = new TrackingConnection();
+        tracking.identifierQuote = "`";
+        tracking.jdbcUrl = "jdbc:gbasedbt-sqli://localhost:9088/appdb:GBASEDBTSERVER=gbase8s;SQLMODE=mysql";
+        TestAgent agent = new TestAgent(tracking);
+
+        agent.connect(new ConnectParams());
+
+        assertEquals("`", agent.getIdentifierQuote());
+    }
+
+    @Test
+    void keepsNonBacktickQuotesForInformixFamilyDrivers() {
+        TrackingConnection tracking = new TrackingConnection();
+        tracking.identifierQuote = "\"";
+        tracking.jdbcUrl = "jdbc:gbasedbt-sqli://localhost:9088/appdb:GBASEDBTSERVER=gbase8s";
+        TestAgent agent = new TestAgent(tracking);
+
+        agent.connect(new ConnectParams());
+
+        assertEquals("\"", agent.getIdentifierQuote());
     }
 
     @Test
@@ -57,6 +177,72 @@ class AbstractJdbcAgentTest {
     }
 
     @Test
+    void validatesLegacyJdbcConnectionsWithConfiguredQueryInsteadOfIsValid() {
+        TrackingConnection tracking = new TrackingConnection();
+        tracking.isValidUnsupported = true;
+        TestAgent agent = new TestAgent(tracking);
+        agent.validationQuery = "SELECT 1";
+
+        assertTrue(agent.testConnection(new ConnectParams()));
+
+        assertEquals(0, tracking.isValidCount);
+        assertEquals(Arrays.asList("setQueryTimeout:5", "execute:SELECT 1"), tracking.calls);
+    }
+
+    @Test
+    void testConnectionCanSkipOpeningAPhysicalConnection() {
+        TrackingConnection tracking = new TrackingConnection();
+        TestAgent agent = new TestAgent(tracking);
+        agent.skipTestConnectionOpen = true;
+
+        assertFalse(agent.testConnection(new ConnectParams()));
+
+        assertEquals(0, tracking.openCount);
+        assertEquals(0, tracking.closeCount);
+    }
+
+    @Test
+    void databaseInfoKeepsSupportedFieldsWhenOneMetadataGetterFails() {
+        DatabaseMetaData metadata = proxy(DatabaseMetaData.class, (method, args) -> {
+            switch (method.getName()) {
+                case "getDatabaseProductName":
+                    return "ExampleDB";
+                case "getDatabaseProductVersion":
+                    throw new UnsupportedOperationException("version unavailable");
+                case "storesLowerCaseIdentifiers":
+                    throw new UnsupportedOperationException("case unavailable");
+                case "storesUpperCaseIdentifiers":
+                    return true;
+                case "storesMixedCaseQuotedIdentifiers":
+                    return true;
+                case "getDriverName":
+                    return "Example JDBC";
+                case "getDriverVersion":
+                    return "1.2.3";
+                case "getJDBCMajorVersion":
+                    return 4;
+                case "getJDBCMinorVersion":
+                    return 2;
+                default:
+                    return defaultValue(method.getReturnType());
+            }
+        });
+        Connection connection = proxy(Connection.class, (method, args) ->
+            "getMetaData".equals(method.getName()) ? metadata : defaultValue(method.getReturnType())
+        );
+
+        Map<String, String> info = JdbcDatabaseInfo.from(connection);
+
+        assertEquals("ExampleDB", info.get("productName"));
+        assertFalse(info.containsKey("productVersion"));
+        assertEquals("upper", info.get("unquotedIdentifierCase"));
+        assertEquals("mixed", info.get("quotedIdentifierCase"));
+        assertEquals("Example JDBC", info.get("driverName"));
+        assertEquals("1.2.3", info.get("driverVersion"));
+        assertEquals("4.2", info.get("jdbcVersion"));
+    }
+
+    @Test
     void delegatesQueryExecutionWithSchemaAndValueReader() {
         TrackingConnection tracking = new TrackingConnection();
         TestAgent agent = new TestAgent(tracking);
@@ -67,7 +253,7 @@ class AbstractJdbcAgentTest {
         assertEquals(Collections.singletonList("VALUE"), result.getColumns());
         assertEquals(Collections.singletonList(Collections.<Object>singletonList("row-value")), result.getRows());
         assertFalse(result.getTruncated());
-        assertEquals(Arrays.asList("setSchema:APP", "setMaxRows:26", "setFetchSize:7", "execute:SELECT VALUE"), tracking.calls);
+        assertEquals(Arrays.asList("execute:USE APP", "setMaxRows:26", "setFetchSize:7", "execute:SELECT VALUE"), tracking.calls);
     }
 
     @Test
@@ -104,6 +290,44 @@ class AbstractJdbcAgentTest {
     }
 
     @Test
+    void executesTransactionControlSqlThroughStatements() {
+        TrackingConnection tracking = new TrackingConnection();
+        TestAgent agent = new TestAgent(tracking);
+        agent.connect(new ConnectParams());
+
+        // Dump files can contain explicit transaction SQL while the JDBC connection is in auto-commit mode.
+        agent.executeQuery("BEGIN;", null, new ExecuteQueryOptions());
+        agent.executeQuery("BEGIN TRANSACTION;", null, new ExecuteQueryOptions());
+        agent.executeQuery("COMMIT;", null, new ExecuteQueryOptions());
+        agent.executeQuery("ROLLBACK;", null, new ExecuteQueryOptions());
+
+        assertEquals(
+            Arrays.asList(
+                "setMaxRows:10001",
+                "execute:BEGIN",
+                "setMaxRows:10001",
+                "execute:BEGIN TRANSACTION",
+                "setMaxRows:10001",
+                "execute:COMMIT",
+                "setMaxRows:10001",
+                "execute:ROLLBACK"
+            ),
+            tracking.calls
+        );
+    }
+
+    @Test
+    void executesPagedTransactionControlSqlThroughStatements() {
+        TrackingConnection tracking = new TrackingConnection();
+        TestAgent agent = new TestAgent(tracking);
+        agent.connect(new ConnectParams());
+
+        agent.executeQueryPage("COMMIT;", null, new QueryPageOptions());
+
+        assertEquals(Collections.singletonList("execute:COMMIT"), tracking.calls);
+    }
+
+    @Test
     void delegatesTransactionsThroughSharedFoundation() {
         TrackingConnection tracking = new TrackingConnection();
         TestAgent agent = new TestAgent(tracking);
@@ -115,7 +339,7 @@ class AbstractJdbcAgentTest {
         assertEquals(
             Arrays.asList(
                 "setAutoCommit:false",
-                "setSchema:APP",
+                "execute:USE APP",
                 "executeUpdate:UPDATE A",
                 "executeUpdate:UPDATE B",
                 "commit",
@@ -123,6 +347,22 @@ class AbstractJdbcAgentTest {
             ),
             tracking.calls
         );
+    }
+
+    @Test
+    void rejectsOneShotTransactionWhenManualTransactionIsOpen() {
+        TrackingConnection tracking = new TrackingConnection();
+        TestAgent agent = new TestAgent(tracking);
+        agent.connect(new ConnectParams());
+        agent.beginManualTransaction(null);
+
+        IllegalStateException error = assertThrows(
+            IllegalStateException.class,
+            () -> agent.executeTransaction(Collections.singletonList("UPDATE A SET ID = 1"), null)
+        );
+
+        assertEquals("Cannot start a one-shot transaction while a manual transaction is open", error.getMessage());
+        assertEquals(Collections.singletonList("setAutoCommit:false"), tracking.calls);
     }
 
     @Test
@@ -175,6 +415,9 @@ class AbstractJdbcAgentTest {
     private static class TestAgent extends AbstractJdbcAgent {
         private final TrackingConnection tracking;
         private int afterConnectCount;
+        private int afterDisconnectCount;
+        private boolean skipTestConnectionOpen;
+        private String validationQuery;
 
         private TestAgent(TrackingConnection tracking) {
             this.tracking = tracking;
@@ -197,8 +440,23 @@ class AbstractJdbcAgentTest {
         }
 
         @Override
+        protected Connection openTestConnection(ConnectParams params) {
+            return skipTestConnectionOpen ? null : openConnection(params);
+        }
+
+        @Override
         protected void afterConnect(ConnectParams params, Connection connection) {
             afterConnectCount += 1;
+        }
+
+        @Override
+        protected void afterDisconnect() {
+            afterDisconnectCount += 1;
+        }
+
+        @Override
+        protected String connectionValidationQuery() {
+            return validationQuery;
         }
 
         @Override
@@ -246,12 +504,24 @@ class AbstractJdbcAgentTest {
         }
     }
 
+    private static ConnectParams postgresCompatibleParams() {
+        ConnectParams params = new ConnectParams();
+        params.setConnection_string("jdbc:postgresql://localhost/test");
+        return params;
+    }
+
     private static final class TrackingConnection {
         private final List<String> calls = new ArrayList<String>();
         private int openCount;
         private int closeCount;
         private int isValidCount;
         private boolean autoCommit = true;
+        private String compatibilityMode;
+        private String identifierQuote = "\"";
+        private String jdbcUrl;
+        private boolean compatibilityQueryFails;
+        private int compatibilityQueryCount;
+        private boolean isValidUnsupported;
 
         private Connection connection() {
             return proxy(Connection.class, new MethodHandler() {
@@ -266,6 +536,9 @@ class AbstractJdbcAgentTest {
                     }
                     if ("isValid".equals(name)) {
                         isValidCount += 1;
+                        if (isValidUnsupported) {
+                            throw new AbstractMethodError("legacy JDBC driver");
+                        }
                         return true;
                     }
                     if ("close".equals(name)) {
@@ -308,6 +581,12 @@ class AbstractJdbcAgentTest {
                     if ("supportsTransactions".equals(method.getName())) {
                         return true;
                     }
+                    if ("getIdentifierQuoteString".equals(method.getName())) {
+                        return identifierQuote;
+                    }
+                    if ("getURL".equals(method.getName())) {
+                        return jdbcUrl;
+                    }
                     return defaultValue(method.getReturnType());
                 }
             });
@@ -321,6 +600,13 @@ class AbstractJdbcAgentTest {
                     if ("execute".equals(name)) {
                         calls.add("execute:" + args[0]);
                         return true;
+                    }
+                    if ("executeQuery".equals(name)) {
+                        compatibilityQueryCount += 1;
+                        if (compatibilityQueryFails) {
+                            throw new IllegalStateException("compatibility query unavailable");
+                        }
+                        return compatibilityResultSet();
                     }
                     if ("getResultSet".equals(name)) {
                         return resultSet();
@@ -346,6 +632,27 @@ class AbstractJdbcAgentTest {
                     }
                     if ("close".equals(name)) {
                         return null;
+                    }
+                    return defaultValue(method.getReturnType());
+                }
+            });
+        }
+
+        private ResultSet compatibilityResultSet() {
+            final boolean[] read = {false};
+            return proxy(ResultSet.class, new MethodHandler() {
+                @Override
+                public Object handle(Method method, Object[] args) {
+                    String name = method.getName();
+                    if ("next".equals(name)) {
+                        if (read[0] || compatibilityMode == null) {
+                            return false;
+                        }
+                        read[0] = true;
+                        return true;
+                    }
+                    if ("getString".equals(name)) {
+                        return compatibilityMode;
                     }
                     return defaultValue(method.getReturnType());
                 }

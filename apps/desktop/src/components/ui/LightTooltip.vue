@@ -1,5 +1,7 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { cn } from "@/lib/common/utils";
+import { floatingArrowOffset, floatingViewportShift, visibleTriggerRect } from "@/lib/common/floatingViewportPosition";
 
 const props = withDefaults(
   defineProps<{
@@ -10,6 +12,9 @@ const props = withDefaults(
     delay?: number;
     closeDelay?: number;
     openOnFocus?: boolean;
+    nowrap?: boolean;
+    surface?: "foreground" | "popover";
+    contentClass?: string;
   }>(),
   {
     disabled: false,
@@ -18,6 +23,8 @@ const props = withDefaults(
     delay: 300,
     closeDelay: 100,
     openOnFocus: true,
+    nowrap: false,
+    surface: "foreground",
   },
 );
 
@@ -26,6 +33,11 @@ const tooltipRef = ref<HTMLElement>();
 const show = ref(false);
 const x = ref(0);
 const y = ref(0);
+const arrowOffset = ref<number>();
+// `nowrap` keeps short hints on one line. Anything wider than the surface cap
+// (max-w-xs) cannot stay on one line without spilling past the bubble, so the
+// content switches to wrapping once the single-line layout overflows (#10451).
+const wrapNowrapContent = ref(false);
 let timer: ReturnType<typeof setTimeout> | null = null;
 let closeTimer: ReturnType<typeof setTimeout> | null = null;
 let suppressOpenUntil = 0;
@@ -60,15 +72,24 @@ const tooltipTransformClass = computed(() => {
 const arrowClass = computed(() => {
   switch (props.side) {
     case "right":
-      return "absolute -left-1 top-1/2 -translate-y-1/2";
+      return "absolute -left-1.25 top-1/2 -translate-y-1/2 border-b border-l";
     case "left":
-      return "absolute -right-1 top-1/2 -translate-y-1/2";
+      return "absolute -right-1.25 top-1/2 -translate-y-1/2 border-t border-r";
     case "bottom":
-      return "absolute -top-1 left-1/2 -translate-x-1/2";
+      return "absolute -top-1.25 left-1/2 -translate-x-1/2 border-t border-l";
     case "top":
     default:
-      return "absolute -bottom-1 left-1/2 -translate-x-1/2";
+      return "absolute -bottom-1.25 left-1/2 -translate-x-1/2 border-b border-r";
   }
+});
+
+const tooltipSurfaceClass = computed(() => (props.surface === "popover" ? "bg-popover text-popover-foreground" : "bg-foreground text-background-solid"));
+
+const arrowSurfaceClass = computed(() => (props.surface === "popover" ? "bg-popover border-border" : "bg-foreground border-foreground"));
+
+const arrowStyle = computed(() => {
+  if (arrowOffset.value === undefined) return undefined;
+  return props.side === "left" || props.side === "right" ? { top: `${arrowOffset.value}px` } : { left: `${arrowOffset.value}px` };
 });
 
 function clearTimer() {
@@ -111,7 +132,8 @@ function isDisabled(): boolean {
 function updatePosition() {
   const el = triggerElement();
   if (!el) return;
-  const rect = el.getBoundingClientRect();
+  arrowOffset.value = undefined;
+  const rect = visibleTriggerRect(el);
   const offset = props.sideOffset;
   switch (props.side) {
     case "right":
@@ -134,10 +156,35 @@ function updatePosition() {
   }
 }
 
+function fitPositionToViewport() {
+  const tooltip = tooltipRef.value;
+  if (!tooltip) return;
+  const rect = tooltip.getBoundingClientRect();
+  const shift = floatingViewportShift(rect, { width: window.innerWidth, height: window.innerHeight });
+  x.value += shift.x;
+  y.value += shift.y;
+  arrowOffset.value = props.side === "left" || props.side === "right" ? floatingArrowOffset(rect.height, shift.y) : floatingArrowOffset(rect.width, shift.x);
+}
+
+/**
+ * Detects a single-line tooltip whose text is wider than the surface. CSS
+ * cannot express "one line unless it does not fit", so the measurement decides
+ * between `whitespace-nowrap` and wrapping. Returns true when the caller must
+ * re-position after the text reflowed.
+ */
+function switchToWrappingWhenOverflowing(): boolean {
+  const tooltip = tooltipRef.value;
+  if (!tooltip || !props.nowrap || wrapNowrapContent.value) return false;
+  if (tooltip.scrollWidth - tooltip.clientWidth <= 1) return false;
+  wrapNowrapContent.value = true;
+  return true;
+}
+
 function close() {
   clearTimer();
   clearCloseTimer();
   show.value = false;
+  wrapNowrapContent.value = false;
   openSource = null;
   removeGlobalListeners();
 }
@@ -172,8 +219,17 @@ function onPointerDown(e: PointerEvent) {
   close();
 }
 
+function onScroll(e: Event) {
+  const target = e.target;
+  if (target instanceof Node && tooltipRef.value?.contains(target)) {
+    clearCloseTimer();
+    return;
+  }
+  close();
+}
+
 function addGlobalListeners() {
-  window.addEventListener("scroll", close, true);
+  window.addEventListener("scroll", onScroll, true);
   window.addEventListener("resize", close);
   window.addEventListener("blur", close);
   document.addEventListener("visibilitychange", close);
@@ -183,7 +239,7 @@ function addGlobalListeners() {
 }
 
 function removeGlobalListeners() {
-  window.removeEventListener("scroll", close, true);
+  window.removeEventListener("scroll", onScroll, true);
   window.removeEventListener("resize", close);
   window.removeEventListener("blur", close);
   document.removeEventListener("visibilitychange", close);
@@ -201,7 +257,15 @@ function open(source: "hover" | "focus") {
   if (source === "focus" ? !hasFocusVisible() : !isPointerActive()) return;
   updatePosition();
   openSource = source;
+  wrapNowrapContent.value = false;
   show.value = true;
+  void nextTick(() => {
+    if (switchToWrappingWhenOverflowing()) {
+      void nextTick(fitPositionToViewport);
+      return;
+    }
+    fitPositionToViewport();
+  });
   addGlobalListeners();
 }
 
@@ -226,7 +290,10 @@ watch(
   () => [props.disabled, props.text] as const,
   () => {
     if (isDisabled() || !props.text) close();
-    else if (show.value) updatePosition();
+    else if (show.value) {
+      updatePosition();
+      void nextTick(fitPositionToViewport);
+    }
   },
 );
 </script>
@@ -239,15 +306,15 @@ watch(
     <div
       v-if="show"
       ref="tooltipRef"
-      class="fixed z-50 rounded-md bg-foreground text-xs text-background"
-      :class="[slots.content ? '' : 'inline-flex w-fit max-w-xs items-center gap-1.5 px-3 py-1.5', tooltipTransformClass]"
+      class="fixed z-(--dbx-floating-layer-z-index) rounded-md text-xs"
+      :class="cn([tooltipSurfaceClass, slots.content ? '' : ['inline-flex w-fit max-w-xs items-center gap-1.5 px-3 py-1.5', nowrap && !wrapNowrapContent ? 'whitespace-nowrap' : 'break-words'], tooltipTransformClass], contentClass)"
       :style="{ left: `${x}px`, top: `${y}px` }"
       role="tooltip"
       @mouseenter="clearCloseTimer"
       @mouseleave="scheduleClose"
     >
       <slot name="content">{{ text }}</slot>
-      <span :class="[arrowClass, 'size-2.5 rotate-45 rounded-[2px] bg-foreground']" aria-hidden="true" />
+      <span :class="[arrowClass, arrowSurfaceClass, 'size-2.5 rotate-45 rounded-[2px]']" :style="arrowStyle" aria-hidden="true" />
     </div>
   </Teleport>
 </template>

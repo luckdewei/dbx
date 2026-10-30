@@ -1,7 +1,7 @@
 import { source } from "@/lib/source";
 import { notFound } from "next/navigation";
 import type { Metadata } from "next";
-import { DocsPage, DocsBody, DocsTitle, DocsDescription } from "fumadocs-ui/page";
+import { DocsPage, DocsBody, DocsTitle } from "fumadocs-ui/page";
 import defaultMdxComponents from "fumadocs-ui/mdx";
 import { Tab, Tabs } from "fumadocs-ui/components/tabs";
 import { Step, Steps } from "fumadocs-ui/components/steps";
@@ -11,7 +11,10 @@ import { ImageZoom } from "fumadocs-ui/components/image-zoom";
 import { Accordion, Accordions } from "fumadocs-ui/components/accordion";
 import type { MDXContent } from "mdx/types";
 import type { TOCItemType } from "fumadocs-core/toc";
-import { buildMetadata, SITE_URL } from "@/lib/metadata";
+import { buildMetadata } from "@/lib/metadata";
+import { resolveLang } from "@/lib/i18n";
+import { markdownPath } from "@/lib/llms";
+import { buildDocStructuredData, serializeStructuredData } from "@/lib/structuredData";
 
 export async function generateMetadata({ params }: { params: Promise<{ lang: string; slug?: string[] }> }): Promise<Metadata> {
   const { lang, slug } = await params;
@@ -22,11 +25,12 @@ export async function generateMetadata({ params }: { params: Promise<{ lang: str
   const description = (page.data.description as string) || undefined;
 
   return buildMetadata({
-    title,
+    title: `${title} · ${lang === "cn" ? "使用文档" : "Documentation"}`,
     description: description ?? "",
-    path: slug ? `/${lang}/docs/${slug.join("/")}` : `/${lang}/docs`,
+    path: slug?.length ? `/${lang}/docs/${slug.join("/")}` : `/${lang}/docs`,
     lang,
     ogType: "article",
+    markdownPath: markdownPath(slug?.length ? `/${lang}/docs/${slug.join("/")}` : `/${lang}/docs`),
   });
 }
 
@@ -56,47 +60,21 @@ export default async function Page({ params }: { params: Promise<{ lang: string;
 
   const title = page.data.title as string;
   const description = (page.data.description as string) || "";
-  const docPath = slug ? `/${lang}/docs/${slug.join("/")}` : `/${lang}/docs`;
-
-  const breadcrumbJsonLd = {
-    "@context": "https://schema.org",
-    "@type": "BreadcrumbList",
-    itemListElement: [
-      { "@type": "ListItem", position: 1, name: "Home", item: SITE_URL },
-      { "@type": "ListItem", position: 2, name: "Docs", item: `${SITE_URL}/${lang}/docs` },
-      ...(slug
-        ? slug.map((segment, i) => ({
-            "@type": "ListItem" as const,
-            position: i + 3,
-            name: segment.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()),
-            item: `${SITE_URL}/${lang}/docs/${slug.slice(0, i + 1).join("/")}`,
-          }))
-        : []),
-    ],
-  };
-
-  const articleJsonLd = {
-    "@context": "https://schema.org",
-    "@type": "TechArticle",
-    headline: title,
-    description,
-    inLanguage: lang === "cn" ? "zh-CN" : "en",
-    isPartOf: {
-      "@type": "WebSite",
-      url: SITE_URL,
-    },
-  };
+  const docPath = slug?.length ? `/${lang}/docs/${slug.join("/")}` : `/${lang}/docs`;
+  const structuredData = buildDocStructuredData(resolveLang(lang), title, description, docPath);
 
   return (
-    <DocsPage toc={toc}>
-      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(breadcrumbJsonLd) }} />
-      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(articleJsonLd) }} />
-      <DocsTitle>{title}</DocsTitle>
-      <DocsDescription>{description}</DocsDescription>
-      <DocsBody>
-        <MDX components={mdxComponents} />
-      </DocsBody>
-    </DocsPage>
+    <main className="contents">
+      <DocsPage toc={toc}>
+        {structuredData.map((entry) => (
+          <script key={entry["@id"]} type="application/ld+json" dangerouslySetInnerHTML={{ __html: serializeStructuredData(entry) }} />
+        ))}
+        <DocsTitle>{title}</DocsTitle>
+        <DocsBody>
+          <MDX components={mdxComponents} />
+        </DocsBody>
+      </DocsPage>
+    </main>
   );
 }
 

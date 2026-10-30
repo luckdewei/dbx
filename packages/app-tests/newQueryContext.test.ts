@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { resolveNewQueryTarget } from "../../apps/desktop/src/lib/newQueryContext.ts";
+import { resolveNewQueryTarget } from "../../apps/desktop/src/lib/sql/newQueryContext.ts";
 import type { ConnectionConfig, QueryTab, TreeNode } from "../../apps/desktop/src/types/database.ts";
 
 function connection(id: string, database = ""): ConnectionConfig {
@@ -13,6 +13,15 @@ function connection(id: string, database = ""): ConnectionConfig {
     username: "postgres",
     password: "",
     database,
+  };
+}
+
+function sqliteConnection(id: string, database = ""): ConnectionConfig {
+  return {
+    ...connection(id, database),
+    db_type: "sqlite",
+    host: "/tmp/real.sqlite",
+    port: 0,
   };
 }
 
@@ -48,6 +57,7 @@ test("new query target prefers the active data tab context", () => {
     connectionId: "conn-data",
     database: "analytics",
     schema: undefined,
+    catalog: undefined,
     shouldRefreshDefaultDatabase: false,
   });
 });
@@ -73,6 +83,8 @@ test("new query target uses the selected sidebar node when there is no active ta
     connectionId: "conn-tree",
     database: "reporting",
     schema: "public",
+    schemaQualifiesSql: true,
+    catalog: undefined,
     shouldRefreshDefaultDatabase: false,
   });
 });
@@ -96,6 +108,7 @@ test("new query target prefers the selected sidebar node after sidebar focus", (
     connectionId: "conn-tree",
     database: "reporting",
     schema: undefined,
+    catalog: undefined,
     shouldRefreshDefaultDatabase: false,
   });
 });
@@ -111,6 +124,70 @@ test("new query target refreshes default database for connection-only sidebar no
   assert.deepEqual(target, {
     connectionId: "conn-tree",
     database: "saved_default",
+    schema: undefined,
+    catalog: undefined,
+    shouldRefreshDefaultDatabase: true,
+  });
+});
+
+test("new query target repairs stale SQLite file paths without changing attached aliases", () => {
+  const stalePathTarget = resolveNewQueryTarget({
+    activeTab: queryTab("sqlite", "/tmp/stale.sqlite"),
+    connections: [sqliteConnection("sqlite", "/tmp/stale.sqlite")],
+  });
+  const attachedAliasTarget = resolveNewQueryTarget({
+    activeTab: queryTab("sqlite", "analytics"),
+    connections: [sqliteConnection("sqlite")],
+  });
+
+  assert.equal(stalePathTarget?.database, "main");
+  assert.equal(attachedAliasTarget?.database, "analytics");
+});
+
+// Issue #11517: without a tab or sidebar context the fallback must not treat the
+// first *configured* connection as if it were connected, because that silently
+// binds the new editor to a database the user may never have opened.
+test("new query target falls back to the single online connection, not the first configured one", () => {
+  const target = resolveNewQueryTarget({
+    connections: [connection("conn-unused", "unused_db"), connection("conn-online", "online_db")],
+    connectedSqlConnectionIds: new Set(["conn-online"]),
+  });
+
+  assert.deepEqual(target, {
+    connectionId: "conn-online",
+    database: "online_db",
+    schema: undefined,
+    shouldRefreshDefaultDatabase: true,
+  });
+});
+
+test("new query target remains unselected when several configured connections are offline", () => {
+  const target = resolveNewQueryTarget({
+    connections: [connection("conn-first", "first_db"), connection("conn-second", "second_db")],
+    connectedSqlConnectionIds: new Set<string>(),
+  });
+
+  assert.equal(target, null);
+});
+
+test("new query target remains unselected when several SQL connections are online", () => {
+  const target = resolveNewQueryTarget({
+    connections: [connection("conn-first", "first_db"), connection("conn-second", "second_db"), connection("conn-third", "third_db")],
+    connectedSqlConnectionIds: new Set(["conn-second", "conn-third"]),
+  });
+
+  assert.equal(target, null);
+});
+
+test("new query target keeps the sole configured connection as the legacy fallback", () => {
+  const target = resolveNewQueryTarget({
+    connections: [connection("conn-only", "only_db")],
+    connectedSqlConnectionIds: new Set<string>(),
+  });
+
+  assert.deepEqual(target, {
+    connectionId: "conn-only",
+    database: "only_db",
     schema: undefined,
     shouldRefreshDefaultDatabase: true,
   });

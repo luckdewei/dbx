@@ -48,6 +48,24 @@ class ValidateAgentsTest(unittest.TestCase):
 
             self.assertEqual([], validate_agents.validate_versions(root))
 
+    def test_versions_accept_crate_native_sqlite_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            root = repo / "agents"
+            crate = repo / "crates" / "dbx-sqlite-worker"
+            root.mkdir()
+            crate.mkdir(parents=True)
+            (root / "settings.gradle").write_text(
+                "include 'common', 'test-support', 'h2'\n",
+                encoding="utf-8",
+            )
+            (root / "versions.json").write_text(
+                json.dumps({"h2": "0.1.0", "sqlite-worker": "0.1.0"}),
+                encoding="utf-8",
+            )
+
+            self.assertEqual([], validate_agents.validate_versions(root))
+
     def test_source_scan_rejects_old_execute_query_patterns(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -127,33 +145,37 @@ class ValidateAgentsTest(unittest.TestCase):
                 problems,
             )
 
-    def test_jdbc_architecture_allows_documented_migration_exceptions(self):
+    def test_versions_include_native_only_modules(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            module = root / "oracle"
-            source = module / "src/main/java/com/dbx/agent/oracle/OracleAgent.java"
-            source.parent.mkdir(parents=True)
-            (module / "build.gradle").write_text(
-                textwrap.dedent(
-                    """
-                    tasks.named('shadowJar') {
-                        manifest {
-                            attributes(
-                                'Agent-Label': 'Oracle',
-                                'Main-Class': 'com.dbx.agent.oracle.OracleAgent'
-                            )
-                        }
-                    }
-                    """
-                ),
+            (root / "settings.gradle").write_text(
+                "def infrastructureModules = ['common', 'test-support']\n"
+                "def driverModules = ['h2']\n"
+                "include(*(infrastructureModules + driverModules))\n",
                 encoding="utf-8",
             )
-            source.write_text(
-                "package com.dbx.agent.oracle; public final class OracleAgent extends BaseDatabaseAgent {}\n",
+            for driver in (
+                "cassandra-go",
+                "hive-go",
+                "oracle-go",
+                "kingbase-go",
+                "iotdb",
+                "neo4j-go",
+                "vastbase-go",
+                "xugu",
+                "duckdb",
+                "rabbitmq",
+                "rocketmq",
+                "zookeeper",
+                "tdengine",
+            ):
+                (root / "drivers" / driver).mkdir(parents=True)
+            (root / "versions.json").write_text(
+                json.dumps({"h2": "0.1.0", "cassandra": "0.1.0", "hive": "0.1.0", "oracle": "0.1.0", "oracle-oci": "0.1.0", "kingbase": "0.1.0", "iotdb": "0.1.0", "neo4j": "0.1.0", "vastbase": "0.1.0", "xugu": "0.1.0", "rabbitmq": "0.1.0", "rocketmq": "0.1.0", "zookeeper": "0.1.0", "tdengine": "0.1.0"}),
                 encoding="utf-8",
             )
 
-            self.assertEqual([], validate_agents.validate_jdbc_architecture(root, {"oracle"}))
+            self.assertEqual([], validate_agents.validate_versions(root))
 
     def test_authoring_template_must_use_shared_foundation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -182,6 +204,32 @@ class ValidateAgentsTest(unittest.TestCase):
                     "docs/examples/jdbc-agent-template/src/main/java/com/dbx/agent/template/TemplateAgent.java: template contains copied JDBC connection creation",
                 ],
                 validate_agents.validate_authoring_template(root),
+            )
+
+    def test_jdbc_pool_coverage_requires_every_jdbc_module(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "build.gradle").write_text(
+                "def pooledJdbcProjects = ['h2'] as Set\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                ["JDBC module missing pooled runtime dependency: access"],
+                validate_agents.validate_jdbc_pool_coverage(root, {"access", "h2", "mongodb"}),
+            )
+
+    def test_jdbc_pool_coverage_rejects_non_jdbc_modules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "build.gradle").write_text(
+                "def pooledJdbcProjects = ['h2', 'mongodb'] as Set\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                ["non-JDBC module listed as pooled JDBC runtime: mongodb"],
+                validate_agents.validate_jdbc_pool_coverage(root, {"h2", "mongodb"}),
             )
 
     def test_manifest_validation_requires_registry_fields(self):
@@ -316,7 +364,7 @@ class ValidateAgentsTest(unittest.TestCase):
                 problems,
             )
 
-    def test_release_runtime_keys_match_java_21_default_and_oracle_8_exception(self):
+    def test_release_runtime_keys_match_java_21_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workflow = root / ".github/workflows/release.yml"
@@ -329,9 +377,12 @@ class ValidateAgentsTest(unittest.TestCase):
                         include:
                           - jre-key: "21"
                             java-version: "21"
+                            modules: "java.base,jdk.security.auth,jdk.security.jgss,jdk.crypto.ec"
+                    declare -A PLATFORMS=(
+                      ["windows-aarch64"]="windows/aarch64"
+                    )
                     detect_jre_key() {
                       case "$name" in
-                        oracle-10g) echo "8" ;;
                         *) echo "21" ;;
                       esac
                     }
@@ -362,7 +413,6 @@ class ValidateAgentsTest(unittest.TestCase):
                             java-version: "21"
                     detect_jre_key() {
                       case "$name" in
-                        oracle-10g) echo "8" ;;
                         *) echo "17" ;;
                       esac
                     }
@@ -383,11 +433,15 @@ class ValidateAgentsTest(unittest.TestCase):
             self.assertEqual(
                 [
                     "release workflow must build the default JRE with key 21",
-                    "non-legacy agents must use JRE key 21",
+                    "agents must use JRE key 21",
                     "registry must publish Java 21 under JRE key 21",
+                    "release workflow JRE must include jdk.security.auth for Kafka Kerberos LoginModule support",
+                    "release workflow JRE must include jdk.security.jgss for Kafka GSSAPI SASL support",
+                    "release workflow JRE must include jdk.crypto.ec for Kafka EC TLS support",
+                    "release workflow must build the managed JRE for windows-aarch64",
                     "native-only registry entries must publish a legacy jar placeholder for older DBX clients",
                     "release workflow must not build Java 21 under JRE key 17",
-                    "non-legacy agents must not use JRE key 17",
+                    "agents must not use JRE key 17",
                     "registry must not publish Java 21 under JRE key 17",
                 ],
                 validate_agents.validate_release_runtime_keys(root),

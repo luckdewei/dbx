@@ -1,28 +1,52 @@
-import { shallowRef, onBeforeUnmount, type ShallowRef, createApp, watch } from "vue";
-import { EditorState, Compartment } from "@codemirror/state";
-import { EditorView, keymap, drawSelection, dropCursor, highlightSpecialChars, highlightActiveLine } from "@codemirror/view";
+import { shallowRef, onBeforeUnmount, getCurrentInstance, type ShallowRef, createApp, watch } from "vue";
+import { EditorSelection, EditorState, Compartment } from "@codemirror/state";
+import { EditorView, keymap, drawSelection, dropCursor, highlightSpecialChars, highlightActiveLine, highlightActiveLineGutter, lineNumbers } from "@codemirror/view";
 import { json } from "@codemirror/lang-json";
 import { search as cmSearch } from "@codemirror/search";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
-import { bracketMatching } from "@codemirror/language";
-import { trimmedSelectionLayer } from "@/lib/codemirrorTrimmedSelectionLayer";
-import { EDITOR_FONT_FAMILY_CSS_VAR, EDITOR_FONT_SIZE_CSS_VAR, cellDetailActiveLineColor, loadEditorTheme, editorFontTheme } from "@/lib/editorThemes";
-import { shortcutToCodeMirrorKey } from "@/lib/shortcutRegistry";
+import { bracketMatching, foldKeymap } from "@codemirror/language";
+import { createConsistentFoldGutter } from "@/lib/editor/codemirrorFoldGutter";
+import { trimmedSelectionLayer } from "@/lib/editor/codemirrorTrimmedSelectionLayer";
+import { EDITOR_FONT_FAMILY_CSS_VAR, EDITOR_FONT_SIZE_CSS_VAR, cellDetailActiveLineColor, loadEditorTheme, editorFontTheme } from "@/lib/editor/editorThemes";
+import { editorClipboardLineEndingsExtension } from "@/lib/editor/editorClipboardLineEndings";
+import { matchesShortcut } from "@/lib/editor/keyboardShortcuts";
+import { shortcutToCodeMirrorKey } from "@/lib/editor/shortcutRegistry";
 import { useSettingsStore } from "@/stores/settingsStore";
-import { CELL_DETAIL_JSON_FORMAT_MAX_LENGTH, isJsonColumnType } from "@/lib/cellDetailPresentation";
-import { clampEditorFontSize, createEditorZoomCommitScheduler, fontSizeFromGestureScale, fontSizeFromWheelDelta } from "@/lib/editorZoom";
+import { isJsonColumnType } from "@/lib/dataGrid/cellDetailPresentation";
+import { clampEditorFontSize, createEditorWheelZoomController, createEditorZoomCommitScheduler, fontSizeFromGestureScale } from "@/lib/editor/editorZoom";
 import i18n from "@/i18n";
 import EditorSearchPanel from "@/components/editor/EditorSearchPanel.vue";
 import type { EditorTheme } from "@/stores/settingsStore";
-import type { AppThemeAppearance } from "@/lib/appTheme";
+import type { AppThemeAppearance, AppThemePalette } from "@/lib/app/appTheme";
+import { selectAllCellDetailText } from "@/lib/dataGrid/cellDetailSelection";
+import { shouldAutoWrapLongSingleLine } from "@/lib/dataGrid/cellDetailWordWrap";
+import { selectLineEnds } from "@/lib/editor/selectLineEnds";
+import { preserveSourceHistory, rawSourceField, restoreRawSource } from "@/lib/editor/preserveTextLineEndings";
 
 export interface UseCellDetailEditorOptions {
   onChange?: (value: string) => void;
   onEscape?: () => void;
   onBlur?: () => void;
-  readOnly?: boolean;
+  /** Return true after handling a save shortcut so CodeMirror consumes it. */
+  onSaveShortcut?: (event: KeyboardEvent) => boolean;
+  language?: "auto" | "json" | "text";
+  /** Keep source line endings and suppress change events during external text synchronization. */
+  preserveLineEndings?: boolean;
+  readOnly?: boolean | (() => boolean);
+  /** Keep cell detail editors gutter-free unless a caller explicitly opts in. */
+  lineNumbers?: boolean;
+  /** A reactive source for opting into CodeMirror line wrapping. */
+  lineWrapping?: () => boolean;
+  /** Add CodeMirror fold controls and keyboard bindings for structured source. */
+  folding?: boolean;
+  /**
+   * When false, Mod+F / replace are not bound so a parent (e.g. Redis value viewer)
+   * can own the unified find surface. Default true for grid cell editors.
+   */
+  enableBuiltinFind?: boolean;
   editorTheme: () => EditorTheme;
   appAppearance: () => AppThemeAppearance;
+  appPalette: () => AppThemePalette;
   fontSize: () => number;
   fontFamily: () => string;
 }
@@ -33,6 +57,7 @@ export interface UseCellDetailEditorReturn {
   getValue: () => string;
   openSearch: () => boolean;
   openReplace: () => boolean;
+  selectRange: (from: number, to: number, options?: { focus?: boolean }) => boolean;
   destroy: () => void;
   view: Readonly<ShallowRef<EditorView | null>>;
 }
@@ -46,8 +71,10 @@ function looksLikeJsonString(text: string): boolean {
   return trimmed.startsWith("{") || trimmed.startsWith("[");
 }
 
+export const CELL_DETAIL_JSON_MODE_MAX_LENGTH = 2_000_000;
+
 function shouldUseJsonMode(columnType?: string, value?: string): boolean {
-  if (value && value.length > CELL_DETAIL_JSON_FORMAT_MAX_LENGTH) return false;
+  if (value && value.length > CELL_DETAIL_JSON_MODE_MAX_LENGTH) return false;
   if (isJsonColumnType(columnType)) return true;
   if (value && looksLikeJsonString(value)) return true;
   return false;
@@ -59,9 +86,14 @@ export function useCellDetailEditor(options: UseCellDetailEditorOptions): UseCel
   const languageComp = new Compartment();
   const themeComp = new Compartment();
   const fontThemeComp = new Compartment();
+  const lineWrappingComp = new Compartment();
+  const readOnlyComp = new Compartment();
+  const shortcutComp = new Compartment();
 
   let destroyed = false;
+  let synchronizingValue = false;
   let currentIsJson = false;
+  let appliedLineWrapping: boolean | null = null;
   let liveFontSize = clampEditorFontSize(options.fontSize());
   let gestureStartFontSize = liveFontSize;
   let isGestureZooming = false;
@@ -75,11 +107,40 @@ export function useCellDetailEditor(options: UseCellDetailEditorOptions): UseCel
     if (settingsStore.editorSettings.fontSize === fontSize) return;
     settingsStore.updateEditorSettings({ fontSize });
   });
+  const wheelZoom = createEditorWheelZoomController();
 
   function syncEditorFontCssVars(fontSize = liveFontSize, fontFamily = options.fontFamily()) {
     if (!wrapperEl) return;
     wrapperEl.style.setProperty(EDITOR_FONT_SIZE_CSS_VAR, `${clampEditorFontSize(fontSize)}px`);
     wrapperEl.style.setProperty(EDITOR_FONT_FAMILY_CSS_VAR, fontFamily);
+  }
+
+  function isReadOnly(): boolean {
+    return typeof options.readOnly === "function" ? options.readOnly() : Boolean(options.readOnly);
+  }
+
+  function isLineWrapping(): boolean {
+    return typeof options.lineWrapping === "function" ? options.lineWrapping() : settingsStore.editorSettings.wordWrap;
+  }
+
+  /**
+   * Effective wrapping for the current document: the caller's explicit wrap
+   * choice, plus automatic folding of super long single-line values (#12320)
+   * so they are readable without dragging the horizontal scrollbar.
+   */
+  function shouldWrapDoc(doc: string): boolean {
+    return isLineWrapping() || shouldAutoWrapLongSingleLine(doc);
+  }
+
+  function applyLineWrapping(doc: string): boolean {
+    const wrap = shouldWrapDoc(doc);
+    if (wrap === appliedLineWrapping) return false;
+    appliedLineWrapping = wrap;
+    return true;
+  }
+
+  function readOnlyExtensions(readOnly: boolean) {
+    return [EditorState.readOnly.of(readOnly), EditorView.editable.of(!readOnly), EditorView.contentAttributes.of(readOnly ? { tabindex: "0" } : {})];
   }
 
   function reconfigureFontTheme(size: number, family: string) {
@@ -126,33 +187,67 @@ export function useCellDetailEditor(options: UseCellDetailEditorOptions): UseCel
   function onEditorGestureEnd(event: Event) {
     event.preventDefault();
     isGestureZooming = false;
+    wheelZoom.holdScrollGesture(event.timeStamp);
     zoomCommitScheduler.flush(liveFontSize);
   }
 
-  watch([() => options.fontSize(), () => options.fontFamily(), () => options.editorTheme(), () => options.appAppearance()], async ([fontSize, fontFamily, editorTheme, appearance]) => {
+  watch([() => options.fontSize(), () => options.fontFamily(), () => options.editorTheme(), () => options.appAppearance(), () => options.appPalette()], async ([fontSize, fontFamily, editorTheme, appearance, palette]) => {
     const editor = view.value;
     if (!editor || destroyed) return;
     if (!isGestureZooming && !zoomCommitScheduler.hasPendingCommit()) {
-      liveFontSize = clampEditorFontSize(fontSize);
+      const nextFontSize = clampEditorFontSize(fontSize);
+      if (nextFontSize !== liveFontSize) wheelZoom.rebase();
+      liveFontSize = nextFontSize;
     }
     syncEditorFontCssVars(liveFontSize, fontFamily);
-    const theme = await loadEditorTheme(editorTheme, appearance);
+    const theme = await loadEditorTheme(editorTheme, appearance, undefined, palette);
     if (!view.value || destroyed) return;
     view.value.dispatch({
       effects: [themeComp.reconfigure(theme), fontThemeComp.reconfigure(editorFontTheme(EditorView, liveFontSize, fontFamily, { fixedHeight: true, scrollable: true }))],
     });
   });
 
+  watch(
+    () => isLineWrapping(),
+    () => {
+      const editor = view.value;
+      if (!editor || destroyed) return;
+      const doc = editor.state.doc.toString();
+      if (!applyLineWrapping(doc)) return;
+      editor.dispatch({ effects: lineWrappingComp.reconfigure(appliedLineWrapping ? EditorView.lineWrapping : []) });
+    },
+  );
+
+  watch(
+    () => settingsStore.editorSettings.shortcuts.selectLineEnds,
+    (shortcut) => {
+      const editor = view.value;
+      if (!editor || destroyed) return;
+      editor.dispatch({ effects: shortcutComp.reconfigure(keymap.of([{ key: shortcutToCodeMirrorKey(shortcut), preventDefault: true, run: selectLineEnds }])) });
+    },
+  );
+
+  watch(
+    () => isReadOnly(),
+    (readOnly) => {
+      const editor = view.value;
+      if (!editor || destroyed) return;
+      editor.dispatch({ effects: readOnlyComp.reconfigure(readOnlyExtensions(readOnly)) });
+    },
+  );
+
   async function create(parent: HTMLElement, initialValue: string, columnType?: string): Promise<void> {
     if (destroyed) return;
 
     const doc = initialValue ?? "";
-    currentIsJson = shouldUseJsonMode(columnType, doc);
+    currentIsJson = options.language !== "text" && (options.language === "json" || shouldUseJsonMode(columnType, doc));
 
-    const theme = await loadEditorTheme(options.editorTheme(), options.appAppearance());
+    const theme = await loadEditorTheme(options.editorTheme(), options.appAppearance(), undefined, options.appPalette());
+    if (destroyed) return;
     liveFontSize = clampEditorFontSize(options.fontSize());
     const fontTheme = editorFontTheme(EditorView, liveFontSize, options.fontFamily(), { fixedHeight: true, scrollable: true });
     const shortcuts = settingsStore.editorSettings.shortcuts;
+    appliedLineWrapping = shouldWrapDoc(doc);
 
     const state = EditorState.create({
       doc,
@@ -164,10 +259,14 @@ export function useCellDetailEditor(options: UseCellDetailEditorOptions): UseCel
             return { dom };
           },
         }),
-        // Minimal setup without line numbers
+        // Keep the compact detail-editor baseline; gutters and wrapping are opt-in.
+        ...(options.lineNumbers ? [lineNumbers(), highlightActiveLineGutter()] : []),
+        ...(options.folding ? [createConsistentFoldGutter()] : []),
         highlightSpecialChars(),
         history(),
+        ...(options.preserveLineEndings ? preserveSourceHistory(doc) : []),
         drawSelection(),
+        editorClipboardLineEndingsExtension(EditorView),
         trimmedSelectionLayer(),
         dropCursor(),
         highlightActiveLine(),
@@ -181,22 +280,34 @@ export function useCellDetailEditor(options: UseCellDetailEditorOptions): UseCel
         keymap.of([
           ...defaultKeymap,
           ...historyKeymap,
-          {
-            key: shortcutToCodeMirrorKey(shortcuts.find),
-            preventDefault: true,
-            run: () => openSearch(),
-          },
-          {
-            key: shortcutToCodeMirrorKey(shortcuts.replace),
-            preventDefault: true,
-            run: () => openReplace(),
-          },
+          ...(options.folding ? foldKeymap : []),
+          // Callers may disable find so a parent surface (e.g. RedisValueViewer) owns Mod+F.
+          ...(options.enableBuiltinFind === false
+            ? []
+            : [
+                {
+                  key: shortcutToCodeMirrorKey(shortcuts.find),
+                  preventDefault: true,
+                  run: () => openSearch(),
+                },
+                {
+                  key: shortcutToCodeMirrorKey(shortcuts.replace),
+                  preventDefault: true,
+                  run: () => openReplace(),
+                },
+              ]),
         ]),
-        EditorView.lineWrapping,
         languageComp.of(currentIsJson ? json() : []),
+        lineWrappingComp.of(shouldWrapDoc(doc) ? EditorView.lineWrapping : []),
+        readOnlyComp.of(readOnlyExtensions(isReadOnly())),
         themeComp.of(theme),
         fontThemeComp.of(fontTheme),
+        shortcutComp.of(keymap.of([{ key: shortcutToCodeMirrorKey(shortcuts.selectLineEnds), preventDefault: true, run: selectLineEnds }])),
         keymap.of([
+          {
+            key: "Mod-a",
+            run: selectAllCellDetailText,
+          },
           {
             key: "Escape",
             run: () => {
@@ -208,14 +319,42 @@ export function useCellDetailEditor(options: UseCellDetailEditorOptions): UseCel
         ]),
         EditorView.updateListener.of((update) => {
           if (update.docChanged) {
-            options.onChange?.(update.state.doc.toString());
+            const nextDoc = update.state.doc.toString();
+            // Auto-wrap (#12320) flips with the document itself: a single long
+            // line folds, then un-folds again as soon as the user breaks it up.
+            if (applyLineWrapping(nextDoc)) {
+              update.view.dispatch({ effects: lineWrappingComp.reconfigure(appliedLineWrapping ? EditorView.lineWrapping : []) });
+            }
+            if (options.preserveLineEndings) {
+              if (synchronizingValue) return;
+              options.onChange?.(update.state.field(rawSourceField));
+            } else {
+              options.onChange?.(nextDoc);
+            }
           }
         }),
         EditorView.domEventHandlers({
-          wheel(event) {
-            if (!event.metaKey && !event.ctrlKey) return false;
+          keydown(event, eventView) {
+            if (matchesShortcut(event, settingsStore.editorSettings.shortcuts.selectLineEnds)) {
+              event.preventDefault();
+              return selectLineEnds(eventView);
+            }
+            if (!options.onSaveShortcut?.(event)) return false;
             event.preventDefault();
-            const next = fontSizeFromWheelDelta(liveFontSize, event.deltaY);
+            event.stopPropagation();
+            return true;
+          },
+          wheel(event) {
+            if (isGestureZooming) {
+              if (event.ctrlKey || event.metaKey) {
+                event.preventDefault();
+                return true;
+              }
+              return false;
+            }
+            const next = wheelZoom.nextFontSize(liveFontSize, event);
+            if (next === null) return false;
+            event.preventDefault();
             applyLiveFontSize(next);
             zoomCommitScheduler.schedule(next);
             return true;
@@ -224,10 +363,12 @@ export function useCellDetailEditor(options: UseCellDetailEditorOptions): UseCel
             options.onBlur?.();
           },
         }),
-        EditorState.readOnly.of(!!options.readOnly),
-        EditorView.editable.of(!options.readOnly),
       ],
     });
+
+    // Re-check after the async theme load: a fast v-if unmount can destroy this
+    // instance while create is still in flight.
+    if (destroyed) return;
 
     wrapperEl = document.createElement("div");
     wrapperEl.style.cssText = "position: relative; width: 100%; height: 100%;";
@@ -245,6 +386,11 @@ export function useCellDetailEditor(options: UseCellDetailEditorOptions): UseCel
     searchApp = createApp(EditorSearchPanel, { view: view.value });
     searchApp.use(i18n);
     searchInstance = searchApp.mount(searchMount) as any;
+
+    // If unmounted during the last sync steps, drop the late-mounted editor.
+    if (destroyed) {
+      destroy();
+    }
   }
 
   function setValue(value: string, columnType?: string) {
@@ -252,7 +398,7 @@ export function useCellDetailEditor(options: UseCellDetailEditorOptions): UseCel
     if (!editor || destroyed) return;
 
     const text = value ?? "";
-    const newIsJson = shouldUseJsonMode(columnType, text);
+    const newIsJson = options.language !== "text" && (options.language === "json" || shouldUseJsonMode(columnType, text));
     const effects: ReturnType<typeof Compartment.prototype.reconfigure>[] = [];
 
     if (newIsJson !== currentIsJson) {
@@ -260,13 +406,19 @@ export function useCellDetailEditor(options: UseCellDetailEditorOptions): UseCel
       currentIsJson = newIsJson;
     }
 
-    editor.dispatch({
-      changes: { from: 0, to: editor.state.doc.length, insert: text },
-      effects,
-    });
+    synchronizingValue = true;
+    try {
+      editor.dispatch({
+        changes: { from: 0, to: editor.state.doc.length, insert: text },
+        effects: options.preserveLineEndings ? [...effects, restoreRawSource.of(text)] : effects,
+      });
+    } finally {
+      synchronizingValue = false;
+    }
   }
 
   function getValue(): string {
+    if (options.preserveLineEndings && view.value) return view.value.state.field(rawSourceField);
     return view.value?.state.doc.toString() ?? "";
   }
 
@@ -278,15 +430,30 @@ export function useCellDetailEditor(options: UseCellDetailEditorOptions): UseCel
     return (searchInstance as any)?.openReplace?.() ?? false;
   }
 
+  function selectRange(from: number, to: number, options?: { focus?: boolean }): boolean {
+    const editor = view.value;
+    if (!editor || destroyed) return false;
+    const max = editor.state.doc.length;
+    const start = Math.max(0, Math.min(from, max));
+    const end = Math.max(0, Math.min(to, max));
+    editor.dispatch({
+      selection: EditorSelection.range(start, end),
+      scrollIntoView: true,
+    });
+    // Default focus for explicit navigation; callers can pass focus:false while typing in a find box.
+    if (options?.focus !== false) editor.focus();
+    return true;
+  }
+
   function destroy() {
-    if (destroyed) return;
+    const alreadyDestroyed = destroyed;
     destroyed = true;
     searchApp?.unmount();
     searchApp = null;
     searchInstance = null;
     view.value?.destroy();
     view.value = null;
-    zoomCommitScheduler.dispose();
+    if (!alreadyDestroyed) zoomCommitScheduler.dispose();
     if (wrapperEl) {
       wrapperEl.removeEventListener("gesturestart", onEditorGestureStart);
       wrapperEl.removeEventListener("gesturechange", onEditorGestureChange);
@@ -298,9 +465,11 @@ export function useCellDetailEditor(options: UseCellDetailEditorOptions): UseCel
     wrapperEl = null;
   }
 
-  onBeforeUnmount(() => {
-    destroy();
-  });
+  if (getCurrentInstance()) {
+    onBeforeUnmount(() => {
+      destroy();
+    });
+  }
 
-  return { create, setValue, getValue, openSearch, openReplace, destroy, view };
+  return { create, setValue, getValue, openSearch, openReplace, selectRange, destroy, view };
 }

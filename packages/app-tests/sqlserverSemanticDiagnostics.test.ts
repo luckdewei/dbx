@@ -2,7 +2,7 @@ import { test } from "vitest";
 import assert from "node:assert/strict";
 import { createPinia, setActivePinia } from "pinia";
 import { useConnectionStore } from "../../apps/desktop/src/stores/connectionStore.ts";
-import { buildSqlSemanticDiagnostics } from "../../apps/desktop/src/lib/sqlSemanticDiagnostics.ts";
+import { buildSqlSemanticDiagnostics } from "../../apps/desktop/src/lib/sql/semantic/diagnostics.ts";
 import type { ConnectionConfig, SqlReferenceAnalysis } from "../../apps/desktop/src/types/database.ts";
 
 const span = (startColumn: number, endColumn: number) => ({
@@ -67,7 +67,7 @@ test("sqlserver completion columns do not query using database name as schema fa
   globalThis.fetch = (async (input) => {
     const url = String(input);
     requests.push(url);
-    if (url === "/api/connection/list") {
+    if (url.split("?")[0] === "/api/connection/list") {
       return new Response(JSON.stringify([sqlServerConn()]), {
         status: 200,
         headers: { "Content-Type": "application/json" },

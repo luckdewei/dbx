@@ -2,8 +2,8 @@
 import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import KvKeyBrowser from "@/components/kv/KvKeyBrowser.vue";
-import * as api from "@/lib/api";
-import type { KvCreateMode } from "@/lib/api";
+import * as api from "@/lib/backend/api";
+import type { KvCreateMode } from "@/lib/backend/api";
 
 const props = defineProps<{ connectionId: string }>();
 
@@ -39,9 +39,15 @@ const labels = computed(() => ({
   deleteTitle: t("zookeeper.deleteTitle"),
   keyPlaceholder: t("zookeeper.keyPlaceholder"),
   keyRequired: t("zookeeper.keyRequired"),
+  rootReadonly: t("zookeeper.rootReadonly"),
   saved: t("zookeeper.saved"),
   deleted: t("zookeeper.deleted"),
   base64Readonly: t("zookeeper.base64Readonly"),
+  clone: t("zookeeper.clone"),
+  copyKey: t("zookeeper.copyKey"),
+  export: t("zookeeper.export"),
+  utf8PreviewLossy: t("zookeeper.utf8PreviewLossy"),
+  utf8PreviewUnavailable: t("zookeeper.utf8PreviewUnavailable"),
   createMode: t("zookeeper.createMode"),
   add: t("zookeeper.add"),
   value: t("zookeeper.value"),
@@ -66,5 +72,5 @@ defineExpose({ focusSearch, refresh });
 </script>
 
 <template>
-  <KvKeyBrowser ref="browserRef" :connection-id="props.connectionId" :api="zookeeperApi" :labels="labels" supports-create-modes enable-node-actions metadata-style="zookeeper" :create-mode-options="createModeOptions" />
+  <KvKeyBrowser ref="browserRef" :connection-id="props.connectionId" :api="zookeeperApi" :labels="labels" supports-create-modes enable-node-actions enable-base64-utf8-preview metadata-style="zookeeper" lazy-hierarchy :create-mode-options="createModeOptions" />
 </template>

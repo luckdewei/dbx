@@ -1,10 +1,14 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref } from "vue";
+import { computed, nextTick, onMounted, ref, watch } from "vue";
 import type { FocusOutsideEvent, PointerDownOutsideEvent } from "reka-ui";
 import { CalendarClock, ChevronDown, ChevronUp, CircleSlash } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { formatTemporalInputValue, type TemporalCellEditorKind } from "@/lib/dataGridTemporalEditor";
+import { isSaveShortcut } from "@/lib/editor/keyboardShortcuts";
+import { useSettingsStore } from "@/stores/settingsStore";
+import { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { formatTemporalInputValue, hostTimezoneOffsetSuffix, parseTemporalInputValue, stepTemporalInputValue, temporalOffsetSuffix, type TemporalCellEditorKind } from "@/lib/dataGrid/dataGridTemporalEditor";
+
+const settingsStore = useSettingsStore();
 
 const props = withDefaults(
   defineProps<{
@@ -13,11 +17,14 @@ const props = withDefaults(
     variant?: "cell" | "inline";
     cellLayout?: "grid" | "transpose";
     commitOnClose?: boolean;
+    fractionPrecision?: number;
+    normalizeValue?: (value: string) => string;
   }>(),
   {
     variant: "cell",
     cellLayout: "grid",
     commitOnClose: true,
+    fractionPrecision: 0,
   },
 );
 
@@ -25,23 +32,40 @@ const emit = defineEmits<{
   "update:modelValue": [value: string];
   commit: [];
   cancel: [];
+  save: [];
 }>();
 
-const open = ref(true);
-const triggerRef = ref<HTMLButtonElement | null>(null);
+const open = ref(false);
+const editorRootRef = ref<HTMLDivElement | null>(null);
+const inputRef = ref<HTMLInputElement | null>(null);
+const localValue = ref(props.modelValue);
 let closeHandled = false;
 let isCommitting = false;
+let skipCommitOnClose = false;
 
 const hasDate = computed(() => props.kind !== "time");
 const hasTime = computed(() => props.kind !== "date");
-const displayValue = computed(() => props.modelValue || "NULL");
-const triggerClass = computed(() =>
+const normalizedFractionPrecision = computed(() => Math.max(0, Math.min(9, props.fractionPrecision || 0)));
+const existingFractionDigits = computed(() => parseFractionDigits(timeValue.value));
+const fractionInputLength = computed(() => normalizedFractionPrecision.value || existingFractionDigits.value.length);
+const fractionInputMaxLength = computed(() => Math.max(1, fractionInputLength.value));
+const showFractionInput = computed(() => hasTime.value && (normalizedFractionPrecision.value > 0 || existingFractionDigits.value.length > 0));
+const timeGridStyle = computed(() => ({
+  gridTemplateColumns: showFractionInput.value ? "3.5rem 0.5rem 3.5rem 0.5rem 3.5rem 0.5rem 5rem" : "3.5rem 0.5rem 3.5rem 0.5rem 3.5rem",
+}));
+const editorRootClass = computed(() => (props.variant === "inline" ? "relative h-9 w-full" : "absolute inset-0 z-10"));
+const inputClass = computed(() =>
   props.variant === "inline"
-    ? "cell-edit-input flex h-9 w-full items-center gap-2 rounded border bg-background px-2 text-left text-xs outline-none hover:border-primary/60 focus:border-primary"
-    : ["cell-edit-input absolute inset-0 z-10 flex items-center gap-1 border-2 border-primary bg-background py-0 text-left text-xs outline-none", props.cellLayout === "transpose" ? "px-1.5" : "px-2.5"],
+    ? "cell-edit-input h-9 w-full rounded border bg-background py-0 pl-2 pr-8 text-left text-xs outline-none hover:border-primary/60 focus:border-primary"
+    : ["cell-edit-input absolute inset-0 z-10 border-2 border-primary bg-background py-0 text-left text-xs outline-none", props.cellLayout === "transpose" ? "pl-1.5 pr-6" : "pl-2.5 pr-7"],
+);
+const triggerButtonClass = computed(() =>
+  props.variant === "inline"
+    ? "absolute right-1 top-1/2 z-20 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+    : "absolute right-0.5 top-1/2 z-20 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground",
 );
 const dateParts = computed(() => {
-  const text = formatTemporalInputValue(props.modelValue, "date");
+  const text = formatTemporalInputValue(localValue.value, "date");
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
   if (!match) {
     const now = new Date();
@@ -51,26 +75,48 @@ const dateParts = computed(() => {
 });
 
 const timeValue = computed(() => {
-  if (props.kind === "time") return formatTemporalInputValue(props.modelValue, "time") || "00:00:00";
-  return formatTemporalInputValue(props.modelValue, "datetime").split("T")[1] || "00:00:00";
+  if (props.kind === "time") return formatTemporalInputValue(localValue.value, "time") || "00:00:00";
+  return formatTemporalInputValue(localValue.value, "datetime").split("T")[1] || "00:00:00";
 });
 
 const timeParts = computed(() => {
-  const [hour = "00", minute = "00", second = "00"] = timeValue.value.split(":");
+  const match = /^(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?$/.exec(timeValue.value);
+  if (!match) return { hour: "00", minute: "00", second: "00" };
+  const [, hour = "00", minute = "00", second = "00"] = match;
   return { hour, minute, second };
 });
 
 onMounted(() => {
-  nextTick(() => triggerRef.value?.focus());
+  nextTick(() => {
+    inputRef.value?.focus();
+    inputRef.value?.select();
+  });
 });
+
+watch(
+  () => props.modelValue,
+  (value) => {
+    localValue.value = value;
+  },
+);
 
 function setOpen(value: boolean) {
   open.value = value;
-  if (!value && props.commitOnClose && !closeHandled) finishCommit();
+  if (!value && props.commitOnClose && !closeHandled && !skipCommitOnClose) finishCommit();
 }
 
-function setModelValue(value: string) {
-  emit("update:modelValue", value);
+function setModelValue(value: string, normalize = false) {
+  const nextValue = normalize ? (props.normalizeValue?.(value) ?? value) : value;
+  // 用户重新输入即解除 closeHandled 闩锁：值编辑器面板里同一实例持续挂载，
+  // 失焦/关板提交（#10667）要求闩锁只覆盖「本次已提交」，否则首次提交后
+  // 后续编辑的 blur 永远不再提交。网格实例提交即卸载，复位对其无影响。
+  closeHandled = false;
+  localValue.value = nextValue;
+  emit("update:modelValue", nextValue);
+}
+
+function updateTextInput(event: Event) {
+  setModelValue((event.target as HTMLInputElement).value);
 }
 
 function updateDate(part: "day" | "month" | "year", rawValue: string | number) {
@@ -90,14 +136,14 @@ function updateDateFromInput(part: "day" | "month" | "year", event: Event) {
 }
 
 function stepDate(part: "day" | "month" | "year", delta: number) {
-  updateDate(part, dateParts.value[part] + delta);
+  setModelValue(stepTemporalInputValue(localValue.value, props.kind, part, delta), true);
 }
 
 function updateTime(part: "hour" | "minute" | "second", rawValue: string | number) {
   const parts = { ...timeParts.value, [part]: normalizeTimePart(rawValue, part === "hour" ? 23 : 59) };
-  const nextTime = `${parts.hour}:${parts.minute}:${parts.second}`;
+  const nextTime = `${parts.hour}:${parts.minute}:${parts.second}${fractionSuffix.value}`;
   if (props.kind === "time") {
-    setModelValue(nextTime);
+    setModelValue(`${nextTime}${temporalOffsetSuffix(localValue.value, props.kind)}`, true);
     return;
   }
   setDateTimeValue(dateParts.value.year, dateParts.value.month, dateParts.value.day, nextTime);
@@ -108,9 +154,27 @@ function updateTimeFromInput(part: "hour" | "minute" | "second", event: Event) {
 }
 
 function stepTime(part: "hour" | "minute" | "second", delta: number) {
-  const max = part === "hour" ? 23 : 59;
-  const current = Number(timeParts.value[part]) || 0;
-  updateTime(part, (current + delta + max + 1) % (max + 1));
+  setModelValue(stepTemporalInputValue(localValue.value, props.kind, part, delta), true);
+}
+
+const fractionSuffix = computed(() => {
+  const digits = existingFractionDigits.value;
+  return digits ? `.${digits}` : "";
+});
+
+function updateFraction(event: Event) {
+  updateFractionValue((event.target as HTMLInputElement).value);
+}
+
+function updateFractionValue(rawValue: string) {
+  const maxLength = Math.max(1, fractionInputLength.value);
+  const digits = rawValue.replace(/\D/g, "").slice(0, maxLength);
+  const nextTime = `${timeParts.value.hour}:${timeParts.value.minute}:${timeParts.value.second}${digits ? `.${digits}` : ""}`;
+  if (props.kind === "time") {
+    setModelValue(`${nextTime}${temporalOffsetSuffix(localValue.value, props.kind)}`, true);
+    return;
+  }
+  setDateTimeValue(dateParts.value.year, dateParts.value.month, dateParts.value.day, nextTime);
 }
 
 function flushInputValue(target: EventTarget | null) {
@@ -120,27 +184,45 @@ function flushInputValue(target: EventTarget | null) {
     updateDate(part, target.value);
   } else if (part === "hour" || part === "minute" || part === "second") {
     updateTime(part, target.value);
+  } else if (part === "fraction") {
+    updateFractionValue(target.value);
   }
 }
 
+function normalizeTextInputValue() {
+  setModelValue(parseTemporalInputValue(localValue.value, props.kind) ?? "", true);
+}
+
 function setNull() {
-  setModelValue("NULL");
+  setModelValue("NULL", true);
 }
 
 function setNow() {
   const now = new Date();
   const dateText = [String(now.getFullYear()).padStart(4, "0"), String(now.getMonth() + 1).padStart(2, "0"), String(now.getDate()).padStart(2, "0")].join("-");
-  const nextTime = [String(now.getHours()).padStart(2, "0"), String(now.getMinutes()).padStart(2, "0"), String(now.getSeconds()).padStart(2, "0")].join(":");
-  if (props.kind === "date") setModelValue(dateText);
-  else if (props.kind === "time") setModelValue(nextTime);
-  else setModelValue(`${dateText} ${nextTime}`);
+  const nextTime = [String(now.getHours()).padStart(2, "0"), String(now.getMinutes()).padStart(2, "0"), String(now.getSeconds()).padStart(2, "0")].join(":") + nowFractionSuffix(now);
+  // tz-aware columns must carry an explicit offset, otherwise the server parses
+  // the host wall clock in its own session timezone
+  const offsetSuffix = temporalOffsetSuffix(localValue.value, props.kind) ? hostTimezoneOffsetSuffix(now) : "";
+  if (props.kind === "date") setModelValue(dateText, true);
+  else if (props.kind === "time") setModelValue(`${nextTime}${offsetSuffix}`, true);
+  else setModelValue(`${dateText} ${nextTime}${offsetSuffix}`, true);
 }
 
 function finishCommit() {
   if (isCommitting) return;
+  normalizeTextInputValue();
   closeHandled = true;
   isCommitting = true;
   emit("commit");
+  // 值编辑器面板用 commitValueEditorEdit 保持同一实例不卸载（以便连续编辑），
+  // isCommitting 若一直闩锁，第二次 ctrl+s/Enter 会在上面的短路处被吞掉（#10515）。
+  // 本 tick 内仍防重入；下一个微任务复位，让持续挂载的实例可再次提交。
+  // closeHandled 不按时间复位——它标记「本次编辑已收尾」，避免提交后的 blur
+  // 再触发一次；用户重新输入时在 setModelValue 里解除（#10667）。
+  nextTick(() => {
+    isCommitting = false;
+  });
 }
 
 function finishCancel() {
@@ -148,9 +230,21 @@ function finishCancel() {
   closeHandled = true;
   isCommitting = true;
   emit("cancel");
+  nextTick(() => {
+    isCommitting = false;
+  });
 }
 
 function onKeydown(event: KeyboardEvent) {
+  // 编辑器的 keydown 一律 stop 掉，因此网格上的保存快捷键不会冒泡过去；
+  // 这里必须自己识别并转发，否则 datetime/date/time 单元格编辑期间按 Ctrl/Cmd+S 会被静默丢弃。
+  if (isSaveShortcut(event, settingsStore.editorSettings.shortcuts)) {
+    event.preventDefault();
+    flushInputValue(event.target);
+    finishCommit();
+    emit("save");
+    return;
+  }
   if (event.key === "Enter") {
     event.preventDefault();
     flushInputValue(event.target);
@@ -162,11 +256,34 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 
+function onInputBlur() {
+  if (!props.commitOnClose || open.value || closeHandled || skipCommitOnClose) return;
+  finishCommit();
+}
+
 function onPopoverInteractOutside(event: PointerDownOutsideEvent | FocusOutsideEvent) {
   const originalEvent = event.detail.originalEvent;
-  if (originalEvent instanceof FocusEvent || isSelectInteractionTarget(originalEvent.target)) {
+  if (isEditorInteractionTarget(originalEvent.target)) {
+    event.preventDefault();
+    closePickerOnly();
+    return;
+  }
+  if (isSelectInteractionTarget(originalEvent.target)) {
     event.preventDefault();
   }
+}
+
+function closePickerOnly() {
+  if (!open.value) return;
+  skipCommitOnClose = true;
+  setOpen(false);
+  nextTick(() => {
+    skipCommitOnClose = false;
+  });
+}
+
+function isEditorInteractionTarget(target: EventTarget | null): boolean {
+  return target instanceof Node && !!editorRootRef.value?.contains(target);
 }
 
 function isSelectInteractionTarget(target: EventTarget | null): boolean {
@@ -181,8 +298,18 @@ function normalizeTimePart(value: string | number, max: number): string {
 
 function setDateTimeValue(year: number, month: number, day: number, time: string) {
   const dateText = [String(year).padStart(4, "0"), String(month).padStart(2, "0"), String(day).padStart(2, "0")].join("-");
-  if (props.kind === "date") setModelValue(dateText);
-  else setModelValue(`${dateText} ${time}`);
+  if (props.kind === "date") setModelValue(dateText, true);
+  else setModelValue(`${dateText} ${time}${temporalOffsetSuffix(localValue.value, props.kind)}`, true);
+}
+
+function parseFractionDigits(value: string): string {
+  return value.match(/\.(\d{1,9})/)?.[1] ?? "";
+}
+
+function nowFractionSuffix(now: Date): string {
+  const precision = normalizedFractionPrecision.value;
+  if (precision <= 0) return "";
+  return `.${String(now.getMilliseconds()).padStart(3, "0").padEnd(precision, "0").slice(0, precision)}`;
 }
 
 function daysInMonth(year: number, month: number): number {
@@ -195,22 +322,27 @@ function twoDigit(value: string | number): string {
 </script>
 
 <template>
-  <Popover :open="open" @update:open="setOpen">
-    <PopoverTrigger as-child>
-      <button ref="triggerRef" type="button" :class="triggerClass" @keydown.stop="onKeydown" @click.stop>
-        <CalendarClock class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-        <span class="min-w-0 flex-1 truncate">{{ displayValue }}</span>
-      </button>
-    </PopoverTrigger>
-    <PopoverContent align="start" side="bottom" class="w-auto gap-1.5 rounded-md p-1.5" @click.stop @keydown.stop="onKeydown" @interact-outside="onPopoverInteractOutside">
+  <Popover :open="open" :modal="false" @update:open="setOpen">
+    <div ref="editorRootRef" :class="editorRootClass" @click.stop>
+      <PopoverAnchor as-child>
+        <input ref="inputRef" :value="localValue" :class="inputClass" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" placeholder="NULL" @blur="onInputBlur" @click.stop @input="updateTextInput" @keydown.stop="onKeydown" />
+      </PopoverAnchor>
+      <PopoverTrigger as-child>
+        <button type="button" :class="triggerButtonClass" @mousedown.prevent @click.stop>
+          <CalendarClock class="h-3.5 w-3.5" />
+          <span class="sr-only">Open temporal picker</span>
+        </button>
+      </PopoverTrigger>
+    </div>
+    <PopoverContent align="start" side="bottom" class="w-auto gap-1.5 rounded-md p-1.5" @click.stop @keydown.stop="onKeydown" @open-auto-focus.prevent @close-auto-focus.prevent @interact-outside="onPopoverInteractOutside">
       <div v-if="hasDate" class="grid grid-cols-[4.5rem_4.5rem_4.5rem] gap-1.5">
         <div class="grid h-7 min-w-0 grid-cols-[1fr_1.35rem] overflow-hidden rounded-md border border-input bg-background">
           <input :value="dateParts.year" data-temporal-part="year" inputmode="numeric" class="min-w-0 bg-transparent px-1 text-center text-[13px] tabular-nums outline-none" @input="updateDateFromInput('year', $event)" />
           <div class="grid border-l">
-            <button type="button" class="flex items-center justify-center hover:bg-muted" @click="stepDate('year', 1)">
+            <button type="button" class="flex items-center justify-center hover:bg-muted" @mousedown.prevent @click="stepDate('year', 1)">
               <ChevronUp class="h-3 w-3" />
             </button>
-            <button type="button" class="flex items-center justify-center border-t hover:bg-muted" @click="stepDate('year', -1)">
+            <button type="button" class="flex items-center justify-center border-t hover:bg-muted" @mousedown.prevent @click="stepDate('year', -1)">
               <ChevronDown class="h-3 w-3" />
             </button>
           </div>
@@ -219,10 +351,10 @@ function twoDigit(value: string | number): string {
         <div class="grid h-7 min-w-0 grid-cols-[1fr_1.35rem] overflow-hidden rounded-md border border-input bg-background">
           <input :value="twoDigit(dateParts.month)" data-temporal-part="month" inputmode="numeric" class="min-w-0 bg-transparent px-1 text-center text-[13px] tabular-nums outline-none" @input="updateDateFromInput('month', $event)" />
           <div class="grid border-l">
-            <button type="button" class="flex items-center justify-center hover:bg-muted" @click="stepDate('month', 1)">
+            <button type="button" class="flex items-center justify-center hover:bg-muted" @mousedown.prevent @click="stepDate('month', 1)">
               <ChevronUp class="h-3 w-3" />
             </button>
-            <button type="button" class="flex items-center justify-center border-t hover:bg-muted" @click="stepDate('month', -1)">
+            <button type="button" class="flex items-center justify-center border-t hover:bg-muted" @mousedown.prevent @click="stepDate('month', -1)">
               <ChevronDown class="h-3 w-3" />
             </button>
           </div>
@@ -231,24 +363,24 @@ function twoDigit(value: string | number): string {
         <div class="grid h-7 min-w-0 grid-cols-[1fr_1.35rem] overflow-hidden rounded-md border border-input bg-background">
           <input :value="twoDigit(dateParts.day)" data-temporal-part="day" inputmode="numeric" class="min-w-0 bg-transparent px-1 text-center text-[13px] tabular-nums outline-none" @input="updateDateFromInput('day', $event)" />
           <div class="grid border-l">
-            <button type="button" class="flex items-center justify-center hover:bg-muted" @click="stepDate('day', 1)">
+            <button type="button" class="flex items-center justify-center hover:bg-muted" @mousedown.prevent @click="stepDate('day', 1)">
               <ChevronUp class="h-3 w-3" />
             </button>
-            <button type="button" class="flex items-center justify-center border-t hover:bg-muted" @click="stepDate('day', -1)">
+            <button type="button" class="flex items-center justify-center border-t hover:bg-muted" @mousedown.prevent @click="stepDate('day', -1)">
               <ChevronDown class="h-3 w-3" />
             </button>
           </div>
         </div>
       </div>
 
-      <div v-if="hasTime" class="grid grid-cols-[3.5rem_0.5rem_3.5rem_0.5rem_3.5rem] items-center gap-1.5">
+      <div v-if="hasTime" class="grid items-center gap-1.5" :style="timeGridStyle">
         <div class="grid h-7 min-w-0 grid-cols-[1fr_1.35rem] overflow-hidden rounded-md border border-input bg-background">
           <input :value="twoDigit(timeParts.hour)" data-temporal-part="hour" inputmode="numeric" class="min-w-0 bg-transparent px-1 text-center text-[13px] tabular-nums outline-none" @input="updateTimeFromInput('hour', $event)" />
           <div class="grid border-l">
-            <button type="button" class="flex items-center justify-center hover:bg-muted" @click="stepTime('hour', 1)">
+            <button type="button" class="flex items-center justify-center hover:bg-muted" @mousedown.prevent @click="stepTime('hour', 1)">
               <ChevronUp class="h-3 w-3" />
             </button>
-            <button type="button" class="flex items-center justify-center border-t hover:bg-muted" @click="stepTime('hour', -1)">
+            <button type="button" class="flex items-center justify-center border-t hover:bg-muted" @mousedown.prevent @click="stepTime('hour', -1)">
               <ChevronDown class="h-3 w-3" />
             </button>
           </div>
@@ -257,10 +389,10 @@ function twoDigit(value: string | number): string {
         <div class="grid h-7 min-w-0 grid-cols-[1fr_1.35rem] overflow-hidden rounded-md border border-input bg-background">
           <input :value="twoDigit(timeParts.minute)" data-temporal-part="minute" inputmode="numeric" class="min-w-0 bg-transparent px-1 text-center text-[13px] tabular-nums outline-none" @input="updateTimeFromInput('minute', $event)" />
           <div class="grid border-l">
-            <button type="button" class="flex items-center justify-center hover:bg-muted" @click="stepTime('minute', 1)">
+            <button type="button" class="flex items-center justify-center hover:bg-muted" @mousedown.prevent @click="stepTime('minute', 1)">
               <ChevronUp class="h-3 w-3" />
             </button>
-            <button type="button" class="flex items-center justify-center border-t hover:bg-muted" @click="stepTime('minute', -1)">
+            <button type="button" class="flex items-center justify-center border-t hover:bg-muted" @mousedown.prevent @click="stepTime('minute', -1)">
               <ChevronDown class="h-3 w-3" />
             </button>
           </div>
@@ -269,22 +401,28 @@ function twoDigit(value: string | number): string {
         <div class="grid h-7 min-w-0 grid-cols-[1fr_1.35rem] overflow-hidden rounded-md border border-input bg-background">
           <input :value="twoDigit(timeParts.second)" data-temporal-part="second" inputmode="numeric" class="min-w-0 bg-transparent px-1 text-center text-[13px] tabular-nums outline-none" @input="updateTimeFromInput('second', $event)" />
           <div class="grid border-l">
-            <button type="button" class="flex items-center justify-center hover:bg-muted" @click="stepTime('second', 1)">
+            <button type="button" class="flex items-center justify-center hover:bg-muted" @mousedown.prevent @click="stepTime('second', 1)">
               <ChevronUp class="h-3 w-3" />
             </button>
-            <button type="button" class="flex items-center justify-center border-t hover:bg-muted" @click="stepTime('second', -1)">
+            <button type="button" class="flex items-center justify-center border-t hover:bg-muted" @mousedown.prevent @click="stepTime('second', -1)">
               <ChevronDown class="h-3 w-3" />
             </button>
           </div>
         </div>
+        <template v-if="showFractionInput">
+          <span class="text-center text-xs text-muted-foreground">.</span>
+          <div class="grid h-7 min-w-0 overflow-hidden rounded-md border border-input bg-background">
+            <input :value="existingFractionDigits" data-temporal-part="fraction" inputmode="numeric" :maxlength="fractionInputMaxLength" class="min-w-0 bg-transparent px-1 text-center text-[13px] tabular-nums outline-none" placeholder="0" @input="updateFraction" />
+          </div>
+        </template>
       </div>
 
       <div class="flex items-center justify-between gap-1">
-        <Button type="button" variant="ghost" size="xs" class="h-6 px-1.5 text-[11px]" @click="setNull">
+        <Button type="button" variant="ghost" size="xs" class="h-6 px-1.5 text-[11px]" @mousedown.prevent @click="setNull">
           <CircleSlash class="h-3 w-3" />
           NULL
         </Button>
-        <Button type="button" variant="ghost" size="xs" class="h-6 px-1.5 text-[11px]" @click="setNow">Now</Button>
+        <Button type="button" variant="ghost" size="xs" class="h-6 px-1.5 text-[11px]" @mousedown.prevent @click="setNow">Now</Button>
       </div>
     </PopoverContent>
   </Popover>

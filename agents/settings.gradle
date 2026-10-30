@@ -2,11 +2,11 @@ rootProject.name = 'dbx-agents'
 
 def infrastructureModules = ['common', 'test-support']
 def driverModules = [
-    'access', 'dameng', 'kingbase', 'vastbase', 'goldendb', 'databend', 'databricks', 'saphana',
-    'teradata', 'vertica', 'firebird', 'exasol', 'oceanbase-oracle', 'gbase8a', 'gbase8s', 'oracle',
-    'oracle-legacy', 'oracle-10g', 'bigquery', 'kylin', 'sundb', 'h2', 'snowflake', 'trino', 'hive',
-    'db2', 'informix', 'neo4j', 'cassandra', 'gaussdb', 'mongodb', 'highgo', 'tdengine', 'yashandb',
-    'iris', 'iotdb', 'etcd', 'zookeeper'
+    'access', 'dameng', 'goldendb', 'databend', 'databricks', 'saphana',
+    'teradata', 'vertica', 'firebird', 'exasol', 'oceanbase-oracle', 'gbase8a', 'gbase8c', 'gbase8s',
+    'bigquery', 'kylin', 'ignite', 'ignite3', 'spanner', 'sundb', 'h2', 'h2-legacy', 'snowflake', 'trino', 'spark',
+    'db2', 'informix', 'mongodb', 'highgo', 'uxdb', 'yashandb', 'oscar',
+    'iris', 'cache', 'kafka', 'sqlserver-legacy', 'transwarp'
 ]
 
 include(*(infrastructureModules + driverModules))

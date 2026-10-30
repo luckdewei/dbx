@@ -13,17 +13,54 @@ npm install -g @dbx-app/cli
 ### Homebrew
 
 ```bash
-brew tap t8y2/dbx
+brew tap t8y2/tap
 brew install dbx-cli
 ```
 
-Requires Node.js 22.13.0 or newer.
+The npm package installs the native CLI for the current platform automatically. Node.js 18.18.0 or newer is only needed for the npm launcher; direct native distributions do not require Node.js.
+
+### Native downloads
+
+The `packages-v*` GitHub Release also provides standalone native CLI archives:
+
+| Platform | Archive |
+| --- | --- |
+| macOS Apple Silicon | `dbx-cli-darwin-arm64.tar.gz` |
+| macOS Intel | `dbx-cli-darwin-x64.tar.gz` |
+| Linux glibc ARM64 | `dbx-cli-linux-arm64-gnu.tar.gz` |
+| Linux glibc x64 | `dbx-cli-linux-x64-gnu.tar.gz` |
+| Windows ARM64 | `dbx-cli-win32-arm64.zip` |
+| Windows x64 | `dbx-cli-win32-x64.zip` |
+
+Verify the downloaded archive with `CLI-SHA256SUMS`, extract it, and run the native binary directly:
+
+```bash
+tar -xzf dbx-cli-linux-x64-gnu.tar.gz
+chmod +x dbx
+./dbx --version
+./dbx connections list --json
+```
+
+Standalone binaries do not require Node.js. They read the same DBX connection storage as the desktop application; set `DBX_DATA_DIR` when using a custom or portable data directory.
+
+## Official Agent Skill
+
+The CLI binary includes the official DBX Skill for shell-capable AI agents. Enable it once after installing or upgrading the CLI:
+
+```bash
+dbx agent setup
+dbx agent status
+```
+
+The default location is `~/.agents/skills/dbx`. `setup` runs entirely offline and can be repeated to install a newer bundled version. It refuses to overwrite an unmanaged or locally modified DBX Skill unless `--force` is supplied. Use `--skills-dir <path>` when the agent reads a different skills root.
 
 ## Usage
 
 ```bash
 dbx doctor
 dbx capabilities
+dbx agent setup
+dbx agent status --json
 dbx connections list --json
 dbx connections list --format csv
 dbx schema list local --json
@@ -42,6 +79,8 @@ dbx open local users
 | ------------------------------------------- | ----------------------------------------------------- |
 | `dbx doctor`                                | Show local DBX config and desktop bridge diagnostics  |
 | `dbx capabilities`                          | Show direct-query and desktop-bridge database support |
+| `dbx agent setup`                           | Install or update the bundled official DBX Skill      |
+| `dbx agent status`                          | Inspect the installed DBX Skill                       |
 | `dbx connections list`                      | List DBX connections without printing secrets         |
 | `dbx schema list <connection>`              | List tables and views                                 |
 | `dbx schema describe <connection> <table>`  | Show table columns                                    |
@@ -90,22 +129,18 @@ Some CLI commands can run without DBX Desktop:
 - `query`
 - `context`
 
-Direct execution currently supports PostgreSQL/Redshift, MySQL-compatible databases (MySQL, Doris, StarRocks), and SQLite. Other database types use the DBX Desktop bridge until their drivers are added to `@dbx-app/node-core`.
+Direct execution supports PostgreSQL/Redshift, MySQL-compatible databases (MySQL, Doris, StarRocks), and SQLite. Other database types use the DBX Desktop bridge or DBX Agent/JDBC infrastructure.
 
 Use `dbx doctor` to check whether the DBX connection database, connection table, native SQLite loader, and desktop bridge are available. Use `dbx capabilities` to list direct-query and bridge-required database types.
 
-If `dbx doctor` reports a `NODE_MODULE_VERSION` mismatch after switching Node.js versions, rebuild the native dependencies with the Node.js version you use to run `dbx`:
-
-```bash
-pnpm rebuild better-sqlite3 keytar --pending
-```
-
-For global npm installs, reinstall the CLI with the same Node.js version:
+If the optional platform package was not installed, reinstall without `--no-optional`:
 
 ```bash
 npm uninstall -g @dbx-app/cli
 npm install -g @dbx-app/cli
 ```
+
+The native CLI does not require `better-sqlite3` and is not coupled to the Node.js ABI.
 
 ## Error Codes
 
@@ -120,6 +155,11 @@ CLI JSON errors use stable codes:
 | `CONNECTION_NOT_FOUND`   | No DBX connection matched the requested name        |
 | `SQL_BLOCKED`            | SQL safety rules blocked execution                  |
 | `DBX_NOT_RUNNING`        | DBX Desktop bridge is unavailable                   |
+| `HOME_NOT_FOUND`         | The default user skills directory cannot be resolved |
+| `SKILL_MODIFIED`         | An unmanaged or locally edited DBX Skill was found  |
+| `SKILL_PATH_UNSAFE`      | A managed Skill path is a symbolic link             |
+| `SKILL_READ_FAILED`      | An installed Skill file could not be read            |
+| `SKILL_WRITE_FAILED`     | The bundled Skill could not be installed             |
 | `ERROR`                  | Unexpected runtime failure                          |
 
 ## Codex

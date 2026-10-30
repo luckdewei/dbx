@@ -1,15 +1,21 @@
 <script setup lang="ts">
-import { computed, ref, onMounted, onBeforeUnmount, h } from "vue";
+import { computed, ref, onMounted, onBeforeUnmount, h, nextTick, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { DatabaseZap, FilePlus2, Loader2, Moon, Sun, SunMoon, History, Bot, ArrowLeftRight, FileCode, BookMarked, GitCompareArrows, TableProperties, Settings, CloudDownload, Package, FileDown } from "@lucide/vue";
+import { invoke } from "@tauri-apps/api/core";
+import { ChevronsRight, DatabaseZap, FilePlus2, Moon, Sun, SunMoon, History, Bot, ArrowLeftRight, FileCode, BookMarked, GitCompareArrows, TableProperties, Settings, LogOut, CloudDownload, Package, PlugZap, FileDown, FolderTree, Pin, PinOff, CalendarClock, Waypoints, RefreshCw } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import LightDropdown from "@/components/ui/LightDropdown.vue";
+import LightDropdown, { type LightDropdownItem } from "@/components/ui/LightDropdown.vue";
 import WindowControls from "@/components/layout/WindowControls.vue";
 import ExportProgressPopover from "@/components/export/ExportProgressPopover.vue";
-import { shouldReserveMacTrafficLightInset, useWindowControls } from "@/composables/useWindowControls";
+import ToolbarUpdateIcon from "@/components/layout/ToolbarUpdateIcon.vue";
+import PluginShortcutToolbar from "@/components/plugins/PluginShortcutToolbar.vue";
+import AppLogo from "@/components/icons/AppLogo.vue";
+import { MAC_TRAFFIC_LIGHT_X, macTrafficLightInsetPaddingForScale, shouldReserveMacTrafficLightInset, useWindowControls } from "@/composables/useWindowControls";
+import { useToast } from "@/composables/useToast";
 import { useSettingsStore } from "@/stores/settingsStore";
-import type { AppThemeMode } from "@/lib/appTheme";
+import { isSystemAppThemeMode, type AppThemeMode } from "@/lib/app/appTheme";
+import { formatShortcutTooltip } from "@/lib/editor/shortcutDisplay";
 
 const GithubIcon = {
   render() {
@@ -24,48 +30,141 @@ const GithubIcon = {
 const props = defineProps<{
   isDark: boolean;
   themeMode: AppThemeMode;
+  showSidebarExpand?: boolean;
   showAiPanel: boolean;
+  activeAiRunCount: number;
+  /** Runs awaiting a write confirmation; the badge turns amber to outrank the
+   *  plain active count (parent PRD §4 line 71). */
+  awaitingAiRunCount: number;
   showHistory: boolean;
   showSqlLibrary: boolean;
+  sqlLibrarySaveFeedbackId: number;
+  showSqlFilePanel: boolean;
   showDriverStore: boolean;
+  showPluginCenter: boolean;
+  showSettingsPage: boolean;
   checkingUpdates: boolean;
+  updateVersion?: string;
   hasUpdateAvailable: boolean;
+  isDownloadingUpdate: boolean;
+  downloadProgress: number | null;
+  updateReadyToInstall: boolean;
+  updateReady: boolean;
   agentDriverUpdateCount: number;
+  hasMcpUpdateAvailable: boolean;
   hasConnections: boolean;
+  canNewQuery: boolean;
   hasSqlFileConnections: boolean;
+  immediateSyncing: boolean;
+  showLogout?: boolean;
 }>();
 
 const emit = defineEmits<{
+  "expand-sidebar": [];
   "new-connection": [];
   "new-query": [];
   "set-theme-mode": [mode: AppThemeMode];
   "toggle-ai": [];
   "toggle-history": [];
   "toggle-sql-library": [];
+  "toggle-sql-file-panel": [];
   "open-github": [];
   "open-settings": [];
   "open-driver-store": [];
+  "open-plugin-center": [];
   "check-updates": [];
   "open-transfer": [];
   "open-sql-file": [];
   "open-schema-diff": [];
   "open-data-compare": [];
+  "open-backups": [];
+  "open-mcp-settings": [];
+  "immediate-sync": [];
+  logout: [];
 }>();
 
 const { t } = useI18n();
+const { toast } = useToast();
+
 const settingsStore = useSettingsStore();
 const toolbarItems = computed(() => settingsStore.editorSettings.toolbarItems);
-const { isMac, isDesktop, showControls, isMaximized, isFullscreen, minimize, toggleMaximize, close } = useWindowControls();
+const webLogoPosition = computed(() => settingsStore.editorSettings.webLogoPosition ?? "left");
+const showToolbarUpdateEntry = computed(() => toolbarItems.value.checkUpdates);
+const { isMac, isDesktop, showControls, isMaximized, isFullscreen, isAlwaysOnTop, minimize, toggleMaximize, toggleAlwaysOnTop, close } = useWindowControls();
+// The always-on-top control is opt-in (外观 → 工具栏): the right side of the
+// toolbar is the most crowded strip in the app. It stays visible while the
+// window is actually pinned even with the setting off, so turning the setting
+// off can never leave the user with a pinned window and no way to unpin it.
+const showAlwaysOnTopButton = computed(() => isDesktop && (toolbarItems.value.alwaysOnTop || isAlwaysOnTop.value));
+const updateTooltip = computed(() => {
+  if (props.hasUpdateAvailable && props.updateReady) return t("updates.restartRequiredTooltip");
+  if (props.hasUpdateAvailable && props.updateReadyToInstall) return t("updates.downloadedReady", { version: props.updateVersion ?? "" });
+  return t("updates.check");
+});
+const sidebarExpandTooltip = computed(() => formatShortcutTooltip(t("sidebar.expand"), settingsStore.editorSettings.shortcuts.toggleSidebar));
+const newQueryTooltip = computed(() => formatShortcutTooltip(t("toolbar.newQuery"), settingsStore.editorSettings.shortcuts.newQuery));
+const aiTooltip = computed(() => formatShortcutTooltip("AI", settingsStore.editorSettings.shortcuts.toggleAiPanel));
+const settingsTooltip = computed(() => (props.hasMcpUpdateAvailable ? t("toolbar.mcpUpdateAvailable") : formatShortcutTooltip(t("settings.title"), settingsStore.editorSettings.shortcuts.openSettings)));
 
-const themeItems = computed(() => [
-  { value: "light", label: t("toolbar.themeLight"), icon: Sun },
-  { value: "dark", label: t("toolbar.themeDark"), icon: Moon },
-  { value: "system", label: t("toolbar.themeSystem"), icon: SunMoon },
-]);
+const sqlLibrarySaveFeedbackActive = ref(false);
+const SQL_LIBRARY_BOOKMARK_PATH = "M10 2 L10 10 L13 7 L16 10 L16 2";
+const SQL_LIBRARY_CHECK_PATH = "M9 9.5 L9 9.5 L11 11.5 L15 7.5 L15 7.5";
+type SvgAnimateElement = SVGElement & { beginElement?: () => void };
+const sqlLibraryIconPathRef = ref<SVGPathElement | null>(null);
+const sqlLibraryMorphToCheckRef = ref<SvgAnimateElement | null>(null);
+const sqlLibraryMorphToBookmarkRef = ref<SvgAnimateElement | null>(null);
+let sqlLibrarySaveFeedbackTimer = 0;
+
+watch(
+  () => props.sqlLibrarySaveFeedbackId,
+  async (id, previousId) => {
+    if (id <= 0 || id === previousId) return;
+    sqlLibrarySaveFeedbackActive.value = false;
+    await nextTick();
+    sqlLibrarySaveFeedbackActive.value = true;
+    window.clearTimeout(sqlLibrarySaveFeedbackTimer);
+    sqlLibrarySaveFeedbackTimer = window.setTimeout(() => {
+      sqlLibrarySaveFeedbackActive.value = false;
+    }, 850);
+  },
+);
+
+watch(sqlLibrarySaveFeedbackActive, async (active) => {
+  await nextTick();
+  const path = sqlLibraryIconPathRef.value;
+  const animation = active ? sqlLibraryMorphToCheckRef.value : sqlLibraryMorphToBookmarkRef.value;
+  const destination = active ? SQL_LIBRARY_CHECK_PATH : SQL_LIBRARY_BOOKMARK_PATH;
+  if (!path) return;
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches || !animation?.beginElement) {
+    path.setAttribute("d", destination);
+    return;
+  }
+  animation.beginElement();
+});
+
 const themeTriggerIcon = computed(() => {
-  if (props.themeMode === "system") return SunMoon;
+  if (isSystemAppThemeMode(props.themeMode)) return SunMoon;
   return props.isDark ? Moon : Sun;
 });
+
+const themeCycle: AppThemeMode[] = ["light", "dark", "system"];
+
+function nextThemeMode(mode: AppThemeMode): AppThemeMode {
+  const index = themeCycle.indexOf(mode);
+  return themeCycle[(index + 1) % themeCycle.length] ?? themeCycle[0];
+}
+
+function themeModeLabel(mode: AppThemeMode): string {
+  if (mode === "light") return t("toolbar.themeLight");
+  if (mode === "dark") return t("toolbar.themeDark");
+  return t("toolbar.themeSystem");
+}
+
+function cycleThemeMode() {
+  const next = nextThemeMode(props.themeMode);
+  emit("set-theme-mode", next);
+  toast(`${t("toolbar.theme")}: ${themeModeLabel(next)}`, 1600);
+}
 
 function onToolbarDblClick(e: MouseEvent) {
   if (isDesktop) return;
@@ -75,7 +174,11 @@ function onToolbarDblClick(e: MouseEvent) {
 }
 
 const toolbarEl = ref<HTMLElement>();
+const newConnectionLabelEl = ref<HTMLElement>();
 const toolbarCollapsed = ref(false);
+const pluginCenterGroup = ref<HTMLElement | null>(null);
+const showPluginCenterShortcuts = computed(() => settingsStore.editorSettings.pluginShortcuts.enabled && settingsStore.editorSettings.pluginShortcuts.position === "plugin-center");
+const shouldReserveTrafficLightInset = computed(() => shouldReserveMacTrafficLightInset(isMac, isFullscreen.value, isDesktop));
 
 function checkToolbarWidth() {
   const el = toolbarEl.value;
@@ -89,7 +192,19 @@ function checkToolbarWidth() {
 
 const rightWrapper = ref<HTMLElement>();
 const rightOverflowCount = ref(0);
-let prevRightAvailable = 0;
+let toolbarLayoutRaf = 0;
+let trafficLightSyncRaf = 0;
+let settlingRightOverflow = false;
+let pendingRightOverflowSettle = false;
+const measuredTrafficLightInset = ref<number | null>(null);
+
+type MacosTrafficLightLayout = {
+  x: number;
+  y: number;
+  center_y: number;
+  previous_center_y: number;
+  reserved_inset: number;
+};
 
 /** Ordered list of right-side item keys that can overflow into "More".
  *  Items earlier in the list overflow first when space shrinks. */
@@ -102,13 +217,22 @@ const collapsibleRightItemDefs = computed(() => {
     disabled: boolean;
   }
   const items: ItemDef[] = [];
-  if (toolbarItems.value.checkUpdates) {
+  if (toolbarItems.value.immediateSync) {
+    items.push({
+      key: "immediateSync",
+      label: t("toolbar.immediateSync"),
+      icon: RefreshCw,
+      action: () => emit("immediate-sync"),
+      disabled: props.immediateSyncing,
+    });
+  }
+  if (showToolbarUpdateEntry.value) {
     items.push({
       key: "checkUpdates",
       label: t("updates.check"),
       icon: CloudDownload,
       action: () => emit("check-updates"),
-      disabled: checkingUpdates.value,
+      disabled: false,
     });
   }
   items.push({
@@ -124,6 +248,15 @@ const collapsibleRightItemDefs = computed(() => {
       label: t("sqlLibrary.title"),
       icon: BookMarked,
       action: () => emit("toggle-sql-library"),
+      disabled: false,
+    });
+  }
+  if (toolbarItems.value.sqlFileTree) {
+    items.push({
+      key: "sqlFileTree",
+      label: t("sqlFileTree.title"),
+      icon: FolderTree,
+      action: () => emit("toggle-sql-file-panel"),
       disabled: false,
     });
   }
@@ -149,8 +282,8 @@ const collapsibleRightItemDefs = computed(() => {
     items.push({
       key: "theme",
       label: t("toolbar.theme"),
-      icon: SunMoon,
-      action: () => {},
+      icon: themeTriggerIcon.value,
+      action: cycleThemeMode,
       disabled: false,
     });
   }
@@ -184,54 +317,151 @@ const overflowRightMenuItems = computed(() => {
   }));
 });
 
-function checkRightOverflow() {
+async function settleRightOverflowOnce() {
   const wrapper = rightWrapper.value;
   if (!wrapper) return;
 
-  const available = wrapper.clientWidth;
-  const growing = available > prevRightAvailable + 1;
-  prevRightAvailable = available;
+  const defsLength = collapsibleRightItemDefs.value.length;
+  if (rightOverflowCount.value > defsLength) {
+    rightOverflowCount.value = defsLength;
+    await nextTick();
+  }
 
-  if (wrapper.scrollWidth > wrapper.clientWidth) {
-    // Overflow — move one more item to "More" (always, even when growing
-    // brought an item back that still doesn't fit)
-    if (rightOverflowCount.value < collapsibleRightItemDefs.value.length) {
+  for (let i = 0; i <= defsLength + 1; i++) {
+    const current = rightWrapper.value;
+    if (!current) return;
+
+    if (current.scrollWidth > current.clientWidth + 1 && rightOverflowCount.value < defsLength) {
       rightOverflowCount.value++;
+      await nextTick();
+      continue;
     }
-  } else if (growing && rightOverflowCount.value > 0) {
-    // Window growing — try bringing one item back
+
+    if (rightOverflowCount.value <= 0) return;
+
     rightOverflowCount.value--;
+    await nextTick();
+
+    const restored = rightWrapper.value;
+    if (restored && restored.scrollWidth <= restored.clientWidth + 1) {
+      continue;
+    }
+
+    rightOverflowCount.value++;
+    await nextTick();
+    return;
   }
 }
+
+async function settleRightOverflow() {
+  if (settlingRightOverflow) {
+    pendingRightOverflowSettle = true;
+    return;
+  }
+
+  settlingRightOverflow = true;
+  try {
+    do {
+      pendingRightOverflowSettle = false;
+      await nextTick();
+      await settleRightOverflowOnce();
+    } while (pendingRightOverflowSettle);
+  } finally {
+    settlingRightOverflow = false;
+  }
+}
+
+function scheduleToolbarLayout() {
+  if (toolbarLayoutRaf) cancelAnimationFrame(toolbarLayoutRaf);
+  toolbarLayoutRaf = requestAnimationFrame(() => {
+    toolbarLayoutRaf = 0;
+    checkToolbarWidth();
+    scheduleTrafficLightSync();
+    void settleRightOverflow();
+  });
+}
+
+function scheduleTrafficLightSync() {
+  if (!shouldReserveTrafficLightInset.value) return;
+  if (trafficLightSyncRaf) cancelAnimationFrame(trafficLightSyncRaf);
+  trafficLightSyncRaf = requestAnimationFrame(() => {
+    trafficLightSyncRaf = 0;
+    void syncTrafficLightsToToolbar();
+  });
+}
+
+async function syncTrafficLightsToToolbar() {
+  if (!shouldReserveTrafficLightInset.value) return;
+  const toolbarRect = toolbarEl.value?.getBoundingClientRect();
+  const targetEl = newConnectionLabelEl.value;
+  const targetRect = targetEl?.getBoundingClientRect();
+  if (!toolbarRect || !targetRect) return;
+  const targetCenterY = targetRect.top - toolbarRect.top + targetRect.height / 2;
+  try {
+    const layout = await invoke<MacosTrafficLightLayout>("set_macos_traffic_light_position", {
+      x: MAC_TRAFFIC_LIGHT_X,
+      y: targetCenterY,
+      scale: settingsStore.editorSettings.uiScale,
+    });
+    measuredTrafficLightInset.value = Math.ceil(layout.reserved_inset / settingsStore.editorSettings.uiScale);
+  } catch (error) {
+    console.warn("[DBX] Failed to sync macOS traffic light position", { targetCenterY, error });
+  }
+}
+
+function handleWindowResize() {
+  scheduleToolbarLayout();
+}
+
+watch(collapsibleRightItemDefs, () => scheduleToolbarLayout(), { flush: "post" });
+watch(
+  () => settingsStore.editorSettings.webLogoPosition,
+  () => scheduleToolbarLayout(),
+  { flush: "post" },
+);
+watch(
+  () => props.showSidebarExpand,
+  () => scheduleToolbarLayout(),
+  { flush: "post" },
+);
+watch(
+  () => settingsStore.editorSettings.uiScale,
+  () => {
+    measuredTrafficLightInset.value = null;
+    scheduleToolbarLayout();
+    window.setTimeout(scheduleTrafficLightSync, 120);
+  },
+);
+watch(shouldReserveTrafficLightInset, () => scheduleToolbarLayout());
 
 // ──────────── Resize observer ────────────
 
 let resizeObserver: ResizeObserver | null = null;
 
 onMounted(() => {
-  resizeObserver = new ResizeObserver(() => {
-    checkToolbarWidth();
-    checkRightOverflow();
-  });
+  resizeObserver = new ResizeObserver(scheduleToolbarLayout);
   if (toolbarEl.value) resizeObserver.observe(toolbarEl.value);
-  window.addEventListener("resize", () => {
-    checkToolbarWidth();
-    checkRightOverflow();
-  });
+  if (rightWrapper.value) resizeObserver.observe(rightWrapper.value);
+  window.addEventListener("resize", handleWindowResize);
+  scheduleToolbarLayout();
 });
 
 onBeforeUnmount(() => {
+  if (toolbarLayoutRaf) cancelAnimationFrame(toolbarLayoutRaf);
+  if (trafficLightSyncRaf) cancelAnimationFrame(trafficLightSyncRaf);
+  window.clearTimeout(sqlLibrarySaveFeedbackTimer);
   resizeObserver?.disconnect();
-  window.removeEventListener("resize", checkToolbarWidth);
+  window.removeEventListener("resize", handleWindowResize);
 });
 
 // ──────────── Left-side "More" items ────────────
 
-const moreItems = computed(() => {
-  const items: Array<{ value: string; label: string; icon: any; action: () => void; disabled: boolean }> = [];
+type ToolbarMenuItem = LightDropdownItem & { action: () => void };
 
-  // Hidden left-side items go into "More"
-  if (!toolbarItems.value.dataTransfer) {
+function buildToolbarMenuItems(includeVisiblePrimaryItems: boolean): ToolbarMenuItem[] {
+  const items: ToolbarMenuItem[] = [];
+
+  if (includeVisiblePrimaryItems || !toolbarItems.value.dataTransfer) {
     items.push({
       value: "transfer",
       label: t("transfer.dataTransfer"),
@@ -240,17 +470,18 @@ const moreItems = computed(() => {
       disabled: !props.hasConnections,
     });
   }
-  if (!toolbarItems.value.driverManager) {
+  if (includeVisiblePrimaryItems || !toolbarItems.value.driverManager) {
     items.push({
       value: "driver-store",
-      label: t("toolbar.driverManager"),
+      label: props.agentDriverUpdateCount > 0 ? `${t("toolbar.driverManager")} (${props.agentDriverUpdateCount})` : t("toolbar.driverManager"),
       icon: Package,
       action: () => emit("open-driver-store"),
       disabled: false,
     });
   }
-
-  // "More" menu items (individually toggleable)
+  if (includeVisiblePrimaryItems || !toolbarItems.value.pluginCenter) {
+    items.push({ value: "plugin-center", label: t("toolbar.pluginCenter"), icon: PlugZap, action: () => emit("open-plugin-center"), disabled: false });
+  }
   if (toolbarItems.value.sqlFile) {
     items.push({
       value: "sql-file",
@@ -278,84 +509,124 @@ const moreItems = computed(() => {
       disabled: !props.hasConnections,
     });
   }
+  items.push({
+    value: "database-backups",
+    label: t("databaseBackup.title"),
+    icon: CalendarClock,
+    action: () => emit("open-backups"),
+    disabled: false,
+  });
+  items.push({
+    value: "mcp-settings",
+    label: t("settings.openMcpSettings"),
+    icon: Waypoints,
+    action: () => emit("open-mcp-settings"),
+    disabled: false,
+  });
 
-  // Append overflowed right-side items at the end
-  for (const ri of overflowRightMenuItems.value) {
+  for (const item of overflowRightMenuItems.value) {
     items.push({
-      value: `right-${ri.value}`,
-      label: ri.label,
-      icon: ri.icon,
-      action: ri.action,
-      disabled: ri.disabled,
+      value: `right-${item.value}`,
+      label: item.label,
+      icon: item.icon,
+      action: item.action,
+      disabled: item.disabled,
     });
   }
 
   return items;
-});
+}
+
+const moreItems = computed(() => buildToolbarMenuItems(false));
 
 const showMoreDropdown = computed(() => moreItems.value.length > 0);
 
-const collapsedItems = computed(() => {
-  const items: Array<{ value: string; label: string; icon: any; action: () => void; disabled: boolean }> = [];
-  if (toolbarItems.value.dataTransfer) {
-    items.push({
-      value: "transfer",
-      label: t("transfer.dataTransfer"),
-      icon: ArrowLeftRight,
-      action: () => emit("open-transfer"),
-      disabled: !props.hasConnections,
-    });
-  }
-  if (toolbarItems.value.driverManager) {
-    items.push({
-      value: "driver-store",
-      label: props.agentDriverUpdateCount > 0 ? `${t("toolbar.driverManager")} (${props.agentDriverUpdateCount})` : t("toolbar.driverManager"),
-      icon: Package,
-      action: () => emit("open-driver-store"),
-      disabled: false,
-    });
-  }
-  // Always include moreItems (may contain hidden left-side items + overflowed right items)
-  if (moreItems.value.length > 0) {
-    items.push(...moreItems.value);
-  }
-  return items;
-});
+const collapsedItems = computed(() => buildToolbarMenuItems(true));
+
+function runMoreItem(value: string) {
+  const item = moreItems.value.find((i) => i.value === value);
+  item?.action();
+}
+
+function runCollapsedItem(value: string) {
+  const item = collapsedItems.value.find((i) => i.value === value);
+  item?.action();
+}
 
 // Per-item overflow visibility helper
 function isRightItemVisible(key: string) {
   return !overflowedRightKeys.value.has(key);
 }
 
-// Track checking updates state for the overflow menu disabled state
-const checkingUpdates = computed(() => props.checkingUpdates);
+const toolbarTextButtonClass = "h-8 px-2 text-xs gap-1 leading-none";
+const toolbarTextLabelClass = "inline-flex translate-y-px items-center leading-none";
+const toolbarDropdownTriggerClass = `inline-flex h-8 items-center gap-1 rounded-[6px] px-2 text-xs font-medium leading-none hover:bg-muted hover:text-foreground dark:hover:bg-muted/50 transition-colors [&>span:first-child]:translate-y-px`;
+const toolbarStyle = computed(() => {
+  if (!shouldReserveTrafficLightInset.value) return undefined;
+  return {
+    paddingLeft: `${measuredTrafficLightInset.value ?? parseInt(macTrafficLightInsetPaddingForScale(settingsStore.editorSettings.uiScale), 10)}px`,
+  };
+});
 </script>
 
 <template>
-  <div ref="toolbarEl" class="h-10 flex items-center gap-1 px-2 border-b bg-muted/30 shrink-0 overflow-hidden" :class="{ 'pl-17.5': shouldReserveMacTrafficLightInset(isMac, isFullscreen, isDesktop) }" data-tauri-drag-region @dblclick="onToolbarDblClick">
-    <Button variant="ghost" size="sm" class="h-8 px-2 text-xs gap-1" @click="emit('new-connection')">
-      <DatabaseZap class="h-3.5 w-3.5" />
-      {{ t("toolbar.newConnection") }}
+  <div ref="toolbarEl" class="app-toolbar h-10 flex items-center gap-1 px-2 border-b bg-muted/30 shrink-0 overflow-hidden" :style="toolbarStyle" data-tauri-drag-region @dblclick="onToolbarDblClick">
+    <a
+      v-if="!isDesktop && webLogoPosition === 'left'"
+      href="https://dbxio.com"
+      target="_blank"
+      rel="noopener noreferrer"
+      class="flex items-center gap-1.5 h-8 px-2 rounded-md hover:bg-muted/60 transition-colors shrink-0 select-none mr-0.5 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+      title="DBX"
+      data-testid="web-brand-logo"
+    >
+      <AppLogo class="h-5 w-5 rounded shrink-0 pointer-events-none" />
+      <span class="font-bold text-xs tracking-tight text-foreground/90 translate-y-px">DBX</span>
+    </a>
+    <Tooltip v-if="showSidebarExpand">
+      <TooltipTrigger as-child>
+        <Button variant="ghost" size="icon" class="toolbar-action-button h-8 w-8 shrink-0" :aria-label="t('sidebar.expand')" @click="emit('expand-sidebar')">
+          <ChevronsRight class="h-4 w-4" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{{ sidebarExpandTooltip }}</TooltipContent>
+    </Tooltip>
+    <Button variant="ghost" size="sm" :class="toolbarTextButtonClass" @click="emit('new-connection')">
+      <span class="inline-flex items-center gap-1">
+        <DatabaseZap class="h-3.5 w-3.5" />
+        <span ref="newConnectionLabelEl" :class="toolbarTextLabelClass">{{ t("toolbar.newConnection") }}</span>
+      </span>
     </Button>
 
-    <Button variant="ghost" size="sm" class="h-8 px-2 text-xs gap-1" @click="emit('new-query')" :disabled="!hasConnections">
-      <FilePlus2 class="h-3.5 w-3.5" />
-      {{ t("toolbar.newQuery") }}
-    </Button>
+    <Tooltip v-if="canNewQuery">
+      <TooltipTrigger as-child>
+        <Button variant="ghost" size="sm" :class="toolbarTextButtonClass" @click="emit('new-query')">
+          <FilePlus2 class="h-3.5 w-3.5" />
+          <span :class="toolbarTextLabelClass">{{ t("toolbar.newQuery") }}</span>
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{{ newQueryTooltip }}</TooltipContent>
+    </Tooltip>
 
     <template v-if="!toolbarCollapsed">
-      <Button v-if="toolbarItems.dataTransfer" variant="ghost" size="sm" class="h-8 px-2 text-xs gap-1" @click="emit('open-transfer')" :disabled="!hasConnections">
+      <Button v-if="toolbarItems.dataTransfer" variant="ghost" size="sm" :class="toolbarTextButtonClass" @click="emit('open-transfer')" :disabled="!hasConnections">
         <ArrowLeftRight class="h-3.5 w-3.5" />
-        {{ t("transfer.dataTransfer") }}
+        <span :class="toolbarTextLabelClass">{{ t("transfer.dataTransfer") }}</span>
       </Button>
 
-      <Button v-if="toolbarItems.driverManager" variant="ghost" size="sm" class="h-8 px-2 text-xs gap-1" :class="{ 'bg-accent': showDriverStore }" @click="emit('open-driver-store')">
+      <Button v-if="toolbarItems.driverManager" variant="ghost" size="sm" :class="[toolbarTextButtonClass, { 'bg-accent': showDriverStore }]" @click="emit('open-driver-store')">
         <Package class="h-3.5 w-3.5" />
-        {{ t("toolbar.driverManager") }}
-        <span v-if="agentDriverUpdateCount > 0" class="ml-0.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-medium leading-none text-white" :aria-label="t('toolbar.updatableDriverCount')">
-          {{ agentDriverUpdateCount > 99 ? "99+" : agentDriverUpdateCount }}
-        </span>
+        <span :class="toolbarTextLabelClass">{{ t("toolbar.driverManager") }}</span>
+        <!-- 小圆点仅提示"有可更新驱动"，具体数量交给对话框内标签页红点展示，避免工具栏长期挂红数字。 -->
+        <span v-if="agentDriverUpdateCount > 0" class="ml-0.5 inline-block h-2 w-2 rounded-full bg-red-500" :aria-label="t('toolbar.updatableDriverCount')" :title="t('toolbar.updatableDriverCount')" />
       </Button>
+      <div v-if="toolbarItems.pluginCenter || showPluginCenterShortcuts" ref="pluginCenterGroup" class="flex shrink-0 items-center rounded-md" :class="{ 'bg-accent': showPluginCenter }">
+        <Button v-if="toolbarItems.pluginCenter" variant="ghost" size="sm" :class="[toolbarTextButtonClass, { 'rounded-r-none': showPluginCenterShortcuts }]" @click="emit('open-plugin-center')">
+          <PlugZap class="h-3.5 w-3.5" />
+          <span :class="toolbarTextLabelClass">{{ t("toolbar.pluginCenter") }}</span>
+        </Button>
+        <PluginShortcutToolbar v-if="showPluginCenterShortcuts" dropdown-only :menu-anchor="pluginCenterGroup" @layout-change="scheduleToolbarLayout" />
+      </div>
 
       <LightDropdown
         v-if="showMoreDropdown"
@@ -363,57 +634,87 @@ const checkingUpdates = computed(() => props.checkingUpdates);
         :items="moreItems"
         :aria-label="t('common.more')"
         :trigger-label="t('common.more')"
-        trigger-class="inline-flex h-8 items-center gap-1 rounded-lg px-2 text-xs font-medium hover:bg-muted hover:text-foreground dark:hover:bg-muted/50 transition-colors"
+        :trigger-class="toolbarDropdownTriggerClass"
         :show-trigger-label="true"
         :show-chevron="true"
         check-position="none"
         align="start"
-        @update:model-value="
-          (value) => {
-            const item = moreItems.find((i) => i.value === value);
-            item?.action();
-          }
-        "
+        @update:model-value="runMoreItem"
       />
     </template>
 
     <template v-if="toolbarCollapsed">
+      <PluginShortcutToolbar v-if="showPluginCenterShortcuts" dropdown-only @layout-change="scheduleToolbarLayout" />
       <LightDropdown
         v-if="collapsedItems.length > 0"
         model-value=""
         :items="collapsedItems"
         :aria-label="t('common.more')"
         :trigger-label="t('common.more')"
-        trigger-class="inline-flex h-8 items-center gap-1 rounded-lg px-2 text-xs font-medium hover:bg-muted hover:text-foreground dark:hover:bg-muted/50 transition-colors"
+        :trigger-class="toolbarDropdownTriggerClass"
         :show-trigger-label="true"
         :show-chevron="true"
         check-position="none"
         align="start"
-        @update:model-value="
-          (value) => {
-            const item = collapsedItems.find((i) => i.value === value);
-            item?.action();
-          }
-        "
+        @update:model-value="runCollapsedItem"
       />
     </template>
 
     <div class="flex-1" data-tauri-drag-region />
 
     <!-- Right-side items wrapped in overflow-aware container -->
-    <div ref="rightWrapper" class="flex items-center gap-1 overflow-hidden">
-      <template v-if="toolbarItems.checkUpdates">
+    <div ref="rightWrapper" class="flex min-w-0 items-center gap-1 overflow-hidden">
+      <PluginShortcutToolbar v-if="settingsStore.editorSettings.pluginShortcuts.enabled && settingsStore.editorSettings.pluginShortcuts.position === 'toolbar'" @layout-change="scheduleToolbarLayout" />
+      <template v-if="showToolbarUpdateEntry">
         <Tooltip>
           <TooltipTrigger as-child>
-            <Button v-show="isRightItemVisible('checkUpdates')" variant="ghost" size="icon" class="relative h-8 w-8 shrink-0" :disabled="checkingUpdates" @click="emit('check-updates')">
-              <Loader2 v-if="checkingUpdates" class="h-4 w-4 animate-spin" />
-              <CloudDownload v-else class="h-4 w-4" />
-              <span v-if="hasUpdateAvailable" class="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-red-500 ring-2 ring-background" />
+            <Button
+              v-show="isRightItemVisible('checkUpdates')"
+              data-toolbar-update-trigger
+              :data-toolbar-update-action="hasUpdateAvailable ? '' : undefined"
+              :variant="hasUpdateAvailable ? 'default' : 'ghost'"
+              :size="hasUpdateAvailable ? 'sm' : 'icon'"
+              class="toolbar-action-button shrink-0"
+              :class="hasUpdateAvailable ? 'h-7 gap-1.5 px-2 text-xs' : 'relative h-8 w-8'"
+              @click="emit('check-updates')"
+            >
+              <template v-if="hasUpdateAvailable">
+                <CloudDownload class="h-3.5 w-3.5" />
+                <span>{{ t("updates.updateAction") }}</span>
+              </template>
+              <ToolbarUpdateIcon v-else :available="false" />
             </Button>
           </TooltipTrigger>
-          <TooltipContent>{{ t("updates.check") }}</TooltipContent>
+          <TooltipContent>{{ updateTooltip }}</TooltipContent>
         </Tooltip>
       </template>
+
+      <Tooltip v-if="toolbarItems.immediateSync">
+        <TooltipTrigger as-child>
+          <Button v-show="isRightItemVisible('immediateSync')" variant="ghost" size="icon" class="toolbar-action-button h-8 w-8 shrink-0" :aria-label="t('toolbar.immediateSync')" :aria-busy="immediateSyncing" :disabled="immediateSyncing" @click="emit('immediate-sync')">
+            <RefreshCw class="toolbar-action-icon h-4 w-4" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{{ t("toolbar.immediateSync") }}</TooltipContent>
+      </Tooltip>
+
+      <Tooltip v-if="showAlwaysOnTopButton">
+        <TooltipTrigger as-child>
+          <Button
+            variant="ghost"
+            size="icon"
+            class="toolbar-action-button relative h-8 w-8 shrink-0"
+            :class="{ 'toolbar-action-button--active bg-accent': isAlwaysOnTop }"
+            :aria-pressed="isAlwaysOnTop"
+            :aria-label="isAlwaysOnTop ? t('toolbar.alwaysOnTopOff') : t('toolbar.alwaysOnTop')"
+            @click="toggleAlwaysOnTop"
+          >
+            <Pin v-if="isAlwaysOnTop" class="toolbar-action-icon h-4 w-4 fill-current" />
+            <PinOff v-else class="toolbar-action-icon h-4 w-4" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{{ isAlwaysOnTop ? t("toolbar.alwaysOnTopOff") : t("toolbar.alwaysOnTop") }}</TooltipContent>
+      </Tooltip>
 
       <div v-show="isRightItemVisible('exportProgress')" class="contents">
         <ExportProgressPopover />
@@ -421,17 +722,56 @@ const checkingUpdates = computed(() => props.checkingUpdates);
 
       <Tooltip v-if="toolbarItems.sqlLibrary">
         <TooltipTrigger as-child>
-          <Button v-show="isRightItemVisible('sqlLibrary')" variant="ghost" size="icon" class="h-8 w-8 shrink-0" :class="{ 'bg-accent': showSqlLibrary }" @click="emit('toggle-sql-library')">
-            <BookMarked class="h-4 w-4" />
+          <Button
+            v-show="isRightItemVisible('sqlLibrary')"
+            data-sql-library-trigger
+            variant="ghost"
+            size="icon"
+            class="toolbar-action-button relative h-8 w-8 shrink-0"
+            :class="{ 'toolbar-action-button--active bg-accent': showSqlLibrary, 'sql-library-save-feedback': sqlLibrarySaveFeedbackActive }"
+            @click="emit('toggle-sql-library')"
+          >
+            <svg
+              aria-hidden="true"
+              xmlns="http://www.w3.org/2000/svg"
+              width="24"
+              height="24"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              class="sql-library-icon toolbar-action-icon h-4 w-4"
+              :class="{ 'toolbar-action-icon--active': showSqlLibrary, 'sql-library-save-feedback-icon text-primary': sqlLibrarySaveFeedbackActive }"
+            >
+              <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H19a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1H6.5a1 1 0 0 1 0-5H20" />
+              <path ref="sqlLibraryIconPathRef" :d="SQL_LIBRARY_BOOKMARK_PATH">
+                <animate ref="sqlLibraryMorphToCheckRef" attributeName="d" :values="`${SQL_LIBRARY_BOOKMARK_PATH};${SQL_LIBRARY_CHECK_PATH}`" dur="180ms" begin="indefinite" fill="freeze" calcMode="spline" keyTimes="0;1" keySplines="0.22 1 0.36 1" />
+                <animate ref="sqlLibraryMorphToBookmarkRef" attributeName="d" :values="`${SQL_LIBRARY_CHECK_PATH};${SQL_LIBRARY_BOOKMARK_PATH}`" dur="180ms" begin="indefinite" fill="freeze" calcMode="spline" keyTimes="0;1" keySplines="0.22 1 0.36 1" />
+              </path>
+            </svg>
+            <span v-if="showSqlLibrary" class="toolbar-panel-status" aria-hidden="true" />
           </Button>
         </TooltipTrigger>
         <TooltipContent>{{ t("sqlLibrary.title") }}</TooltipContent>
       </Tooltip>
 
+      <Tooltip v-if="toolbarItems.sqlFileTree">
+        <TooltipTrigger as-child>
+          <Button v-show="isRightItemVisible('sqlFileTree')" variant="ghost" size="icon" class="toolbar-action-button relative h-8 w-8 shrink-0" :class="{ 'toolbar-action-button--active bg-accent': showSqlFilePanel }" @click="emit('toggle-sql-file-panel')">
+            <FolderTree class="toolbar-action-icon h-4 w-4" :class="{ 'toolbar-action-icon--active': showSqlFilePanel }" />
+            <span v-if="showSqlFilePanel" class="toolbar-panel-status" aria-hidden="true" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{{ t("sqlFileTree.title") }}</TooltipContent>
+      </Tooltip>
+
       <Tooltip v-if="toolbarItems.history">
         <TooltipTrigger as-child>
-          <Button v-show="isRightItemVisible('history')" variant="ghost" size="icon" class="h-8 w-8 shrink-0" :class="{ 'bg-accent': showHistory }" @click="emit('toggle-history')">
-            <History class="h-4 w-4" />
+          <Button v-show="isRightItemVisible('history')" variant="ghost" size="icon" class="toolbar-action-button relative h-8 w-8 shrink-0" :class="{ 'toolbar-action-button--active bg-accent': showHistory }" @click="emit('toggle-history')">
+            <History class="toolbar-action-icon h-4 w-4" :class="{ 'toolbar-action-icon--active': showHistory }" />
+            <span v-if="showHistory" class="toolbar-panel-status" aria-hidden="true" />
           </Button>
         </TooltipTrigger>
         <TooltipContent>{{ t("history.title") }}</TooltipContent>
@@ -439,39 +779,38 @@ const checkingUpdates = computed(() => props.checkingUpdates);
 
       <Tooltip v-if="toolbarItems.ai">
         <TooltipTrigger as-child>
-          <Button v-show="isRightItemVisible('ai')" variant="ghost" size="icon" class="h-8 w-8 shrink-0" :class="{ 'bg-accent': showAiPanel }" @click="emit('toggle-ai')">
-            <Bot class="h-4 w-4" />
+          <Button v-show="isRightItemVisible('ai')" variant="ghost" size="icon" class="toolbar-action-button relative h-8 w-8 shrink-0" :class="{ 'toolbar-action-button--active bg-accent': showAiPanel }" @click="emit('toggle-ai')">
+            <Bot class="toolbar-action-icon h-4 w-4" :class="{ 'toolbar-action-icon--active': showAiPanel }" />
+            <span
+              v-if="awaitingAiRunCount > 0"
+              class="absolute right-0.5 top-0.5 flex h-3 min-w-3 items-center justify-center rounded-full bg-amber-500 px-0.5 text-[8px] font-semibold leading-none text-white"
+              :aria-label="t('ai.toolbarAwaitingConfirmation', { count: awaitingAiRunCount })"
+              :title="t('ai.toolbarAwaitingConfirmation', { count: awaitingAiRunCount })"
+            >
+              {{ awaitingAiRunCount > 9 ? "9+" : awaitingAiRunCount }}
+            </span>
+            <span v-else-if="activeAiRunCount > 0" class="absolute right-0.5 top-0.5 flex h-3 min-w-3 items-center justify-center rounded-full bg-primary px-0.5 text-[8px] font-semibold leading-none text-primary-foreground">
+              {{ activeAiRunCount > 9 ? "9+" : activeAiRunCount }}
+            </span>
+            <span v-if="showAiPanel" class="toolbar-panel-status" aria-hidden="true" />
           </Button>
         </TooltipTrigger>
-        <TooltipContent>AI</TooltipContent>
+        <TooltipContent>{{ aiTooltip }}</TooltipContent>
       </Tooltip>
 
       <Tooltip v-if="toolbarItems.theme">
         <TooltipTrigger as-child>
-          <span v-show="isRightItemVisible('theme')" class="inline-flex shrink-0">
-            <LightDropdown
-              :model-value="themeMode"
-              :items="themeItems"
-              :aria-label="t('toolbar.theme')"
-              :trigger-icon="themeTriggerIcon"
-              trigger-class="inline-flex h-8 w-8 items-center justify-center rounded-md hover:bg-accent hover:text-accent-foreground"
-              trigger-icon-class="h-4 w-4"
-              item-icon-class="h-4 w-4"
-              :show-trigger-label="false"
-              :show-chevron="false"
-              check-position="right"
-              align="end"
-              @update:model-value="(value) => emit('set-theme-mode', value as AppThemeMode)"
-            />
-          </span>
+          <Button v-show="isRightItemVisible('theme')" variant="ghost" size="icon" class="toolbar-action-button h-8 w-8 shrink-0" :aria-label="t('toolbar.theme')" @click="cycleThemeMode">
+            <component :is="themeTriggerIcon" :key="themeMode" class="toolbar-action-icon toolbar-theme-icon h-4 w-4" />
+          </Button>
         </TooltipTrigger>
         <TooltipContent>{{ t("toolbar.theme") }}</TooltipContent>
       </Tooltip>
 
       <Tooltip v-if="toolbarItems.github">
         <TooltipTrigger as-child>
-          <Button v-show="isRightItemVisible('github')" variant="ghost" size="icon" class="h-8 w-8 shrink-0" @click="emit('open-github')">
-            <svg class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor">
+          <Button v-show="isRightItemVisible('github')" variant="ghost" size="icon" class="toolbar-action-button h-8 w-8 shrink-0" @click="emit('open-github')">
+            <svg class="toolbar-action-icon h-4 w-4" viewBox="0 0 24 24" fill="currentColor">
               <path
                 d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.438 9.8 8.205 11.387.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61-.546-1.387-1.333-1.756-1.333-1.756-1.09-.745.083-.729.083-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 21.795 24 17.295 24 12 24 5.37 18.627 0 12 0z"
               />
@@ -483,15 +822,159 @@ const checkingUpdates = computed(() => props.checkingUpdates);
     </div>
     <!-- /rightWrapper -->
 
+    <a
+      v-if="!isDesktop && webLogoPosition === 'right'"
+      href="https://dbxio.com"
+      target="_blank"
+      rel="noopener noreferrer"
+      class="flex items-center gap-1.5 h-8 px-2 rounded-md hover:bg-muted/60 transition-colors shrink-0 select-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+      title="DBX"
+      data-testid="web-brand-logo"
+    >
+      <AppLogo class="h-5 w-5 rounded shrink-0 pointer-events-none" />
+      <span class="font-bold text-xs tracking-tight text-foreground/90 translate-y-px">DBX</span>
+    </a>
+
     <Tooltip>
       <TooltipTrigger as-child>
-        <Button variant="ghost" size="icon" class="h-8 w-8 shrink-0" @click="emit('open-settings')">
-          <Settings class="h-4 w-4" />
+        <Button variant="ghost" size="icon" class="toolbar-action-button relative h-8 w-8 shrink-0" :class="{ 'toolbar-action-button--active bg-accent': showSettingsPage }" @click="emit('open-settings')">
+          <Settings class="toolbar-action-icon h-4 w-4" :class="{ 'toolbar-action-icon--active': showSettingsPage }" />
+          <span v-if="showSettingsPage" class="toolbar-panel-status" aria-hidden="true" />
+          <span v-if="hasMcpUpdateAvailable" class="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-red-500 ring-2 ring-background" :aria-label="t('toolbar.mcpUpdateAvailable')" :title="t('toolbar.mcpUpdateAvailable')" />
         </Button>
       </TooltipTrigger>
-      <TooltipContent>{{ t("settings.title") }}</TooltipContent>
+      <TooltipContent>{{ settingsTooltip }}</TooltipContent>
+    </Tooltip>
+
+    <Tooltip v-if="showLogout">
+      <TooltipTrigger as-child>
+        <Button variant="ghost" size="icon" class="toolbar-action-button h-8 w-8 shrink-0" :aria-label="t('auth.logout')" @click="emit('logout')">
+          <LogOut class="toolbar-action-icon h-4 w-4" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{{ t("auth.logout") }}</TooltipContent>
     </Tooltip>
 
     <WindowControls v-if="showControls" :is-maximized="isMaximized" @minimize="minimize" @toggle-maximize="toggleMaximize" @close="close" />
   </div>
 </template>
+
+<style scoped>
+.toolbar-action-icon {
+  transform: translateY(0) scale(1);
+  transition:
+    color 180ms ease,
+    transform 200ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.toolbar-action-button:active:not(:disabled) .toolbar-action-icon,
+.toolbar-action-button:active:not(:disabled) :deep([data-toolbar-update-icon]) {
+  transform: scale(0.82);
+}
+
+.toolbar-action-icon--active {
+  color: var(--primary);
+  transform: translateY(-1px) scale(1.06);
+}
+
+.toolbar-panel-status {
+  position: absolute;
+  bottom: 3px;
+  left: 50%;
+  width: 3px;
+  height: 3px;
+  border-radius: 9999px;
+  background: var(--primary);
+  transform: translateX(-50%);
+  animation: toolbar-panel-status-in 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.toolbar-theme-icon {
+  animation: toolbar-theme-icon-in 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes toolbar-panel-status-in {
+  0% {
+    opacity: 0;
+    transform: translateX(-50%) translateY(2px) scale(0);
+  }
+  70% {
+    transform: translateX(-50%) translateY(0) scale(1.3);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0) scale(1);
+  }
+}
+
+@keyframes toolbar-theme-icon-in {
+  0% {
+    opacity: 0;
+    transform: rotate(-18deg) scale(0.72);
+  }
+  100% {
+    opacity: 1;
+    transform: rotate(0) scale(1);
+  }
+}
+
+@keyframes sql-library-save-confirm-button {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+  36% {
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--primary) 38%, transparent),
+      0 0 0 3px color-mix(in srgb, var(--primary) 8%, transparent);
+  }
+}
+
+@keyframes sql-library-save-confirm-icon {
+  0% {
+    opacity: 0.75;
+    transform: scale(0.92);
+  }
+  38% {
+    opacity: 1;
+    transform: translateY(-1px) scale(1.12);
+  }
+  68% {
+    transform: scale(0.98);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.sql-library-save-feedback {
+  animation: sql-library-save-confirm-button 760ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.sql-library-icon {
+  transition: color 180ms ease;
+}
+
+.sql-library-save-feedback-icon {
+  animation: sql-library-save-confirm-icon 760ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toolbar-action-icon,
+  .toolbar-panel-status,
+  .toolbar-theme-icon {
+    animation: none;
+    transition: none;
+  }
+
+  .sql-library-save-feedback,
+  .sql-library-save-feedback-icon {
+    animation: none;
+  }
+
+  .sql-library-icon {
+    transition: none;
+  }
+}
+</style>

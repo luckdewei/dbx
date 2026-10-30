@@ -3,7 +3,8 @@ set -euo pipefail
 
 # Build offline ZIP bundles for each platform.
 # Usage: ./scripts/build_offline_zip.sh <release-dir>
-# The release-dir must contain agent-registry.json, dbx-agent-*.jar, and dbx-jre-*.tar.gz
+# The release-dir must contain agent-registry.json, raw driver artifacts, and dbx-jre-*.tar.zst.
+# If offline-jdbc/jdbc is present, it is included as the managed JDBC payload.
 
 RELEASE_DIR="$(cd "${1:?Usage: build_offline_zip.sh <release-dir>}" && pwd)"
 
@@ -30,9 +31,13 @@ for platform in "${PLATFORMS[@]}"; do
 
   cp "$RELEASE_DIR/agent-registry.json" "$WORK/"
 
+  if [ -d "$RELEASE_DIR/offline-jdbc/jdbc" ]; then
+    cp -R "$RELEASE_DIR/offline-jdbc/jdbc" "$WORK/"
+  fi
+
   # Copy all JRE archives for this platform
   JRE_COUNT=0
-  for jre_file in "$RELEASE_DIR"/dbx-jre-*-"$platform".tar.gz; do
+  for jre_file in "$RELEASE_DIR"/dbx-jre-*-"$platform".tar.zst; do
     [ -f "$jre_file" ] || continue
     cp "$jre_file" "$WORK/jre/"
     JRE_COUNT=$((JRE_COUNT + 1))
@@ -55,8 +60,19 @@ for platform in "${PLATFORMS[@]}"; do
     cp "$native_file" "$WORK/drivers/"
   done
 
+  # The SQLite SSH worker executes on the remote SSH host, so its Linux binaries
+  # must ship in every bundle: the desktop platform never matches them, which
+  # otherwise leaves the worker missing from offline packages (#8987).
+  for worker_file in "$RELEASE_DIR"/dbx-agent-sqlite-worker-*-linux-x64 \
+      "$RELEASE_DIR"/dbx-agent-sqlite-worker-*-linux-aarch64; do
+    [ -f "$worker_file" ] || continue
+    cp "$worker_file" "$WORK/drivers/"
+  done
+
   ZIP_NAME="dbx-agents-offline-${platform}.zip"
-  (cd "$WORK" && zip -r "$RELEASE_DIR/$ZIP_NAME" agent-registry.json jre/ drivers/)
+  ZIP_ENTRIES=(agent-registry.json jre/ drivers/)
+  [ -d "$WORK/jdbc" ] && ZIP_ENTRIES+=(jdbc/)
+  (cd "$WORK" && zip -r "$RELEASE_DIR/$ZIP_NAME" "${ZIP_ENTRIES[@]}")
   SIZE=$(du -h "$RELEASE_DIR/$ZIP_NAME" | cut -f1)
   echo "Created $ZIP_NAME ($SIZE)"
 done

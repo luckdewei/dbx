@@ -22,7 +22,7 @@ class EwkbWktDecoderTest {
 
     // ──────────────────────────────────────────────────────────────────────
     // Cross-checked against the Rust ewkb_to_wkt tests in
-    // crates/dbx-core/src/db/postgres.rs (same hex inputs, same expected WKT).
+    // crates/dbx-driver-support/src/wkb.rs (same hex inputs, same expected WKT).
     // ──────────────────────────────────────────────────────────────────────
 
     @Test
@@ -80,6 +80,20 @@ class EwkbWktDecoderTest {
     void preservesAlreadyEwktTextWithSrid() {
         String ewkt = "SRID=4326;POINT(116.397 39.908)";
         assertEquals(ewkt, EwkbWktDecoder.decode(ewkt));
+    }
+
+    @Test
+    void spatialDecodeSeparatesSridFromVisibleWkt() {
+        SpatialValue value = EwkbWktDecoder.decodeSpatial("SRID=3857;POINT(1 2)");
+        assertEquals("POINT(1 2)", value.getWkt());
+        assertEquals(3857, value.getSrid());
+    }
+
+    @Test
+    void spatialDecodeRetainsEwkbSrid() {
+        SpatialValue value = EwkbWktDecoder.decodeSpatial(hex("0101000020E6100000C520B07268195D404E62105839F44340"));
+        assertEquals("POINT(116.397 39.908)", value.getWkt());
+        assertEquals(4326, value.getSrid());
     }
 
     @Test

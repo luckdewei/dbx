@@ -2,7 +2,7 @@
 
 ## 概述
 
-该功能为 DBX 增加了消息队列（Message Queue）管理能力，首批支持 **Apache Pulsar** 的管理操作。架构保留 Kafka、RocketMQ 扩展点，但在适配器完成前 UI 只允许创建 Pulsar 连接。
+该功能为 DBX 增加了消息队列（Message Queue）管理能力，支持 **Apache Pulsar**、**Apache Kafka**、**Apache RocketMQ** 与 **RabbitMQ**。四种系统在连接对话框中为独立顶层入口；控制台复用 `MqAdminConsole` 壳层，按 `systemKind` 与 capabilities 展示可用面板。
 
 ## 功能特性
 
@@ -17,9 +17,10 @@
 - ✅ **监控统计**：消息速率、吞吐量、积压大小
 - ✅ **Raw Admin API**：直接发送自定义管理请求（逃生通道）
 
-### 前端 UI（Pulsar 首期核心可用）
-- ✅ 连接配置、控制台入口、租户/命名空间/主题/订阅/监控/生产者消费者/策略/权限/Raw API 面板
-- ⚠️ 后续扩展：完整 i18n、Kafka/RocketMQ 适配器、高级 typed policy（最大生产者/消费者数、TTL、deduplication）
+### 前端 UI
+- ✅ 连接配置、控制台入口、租户/命名空间/主题/订阅/监控/生产者消费者/策略/权限/Raw API 面板（按 MQ 类型与 capabilities 显示）
+- ✅ Kafka / RocketMQ：无 tenant/namespace，使用 `_flat_mq` 合成上下文
+- ⚠️ 后续扩展：高级 typed policy（最大生产者/消费者数、TTL、deduplication）、RocketMQ ACL 2.0
 
 ## 架构设计
 
@@ -147,6 +148,39 @@
   "pinnedVersion": "3.1.0"         // 强制使用特定 API profile
 }
 ```
+
+## RocketMQ 5.x Proxy 接入
+
+在 RocketMQ 连接中选择接入模式：
+
+- **NameServer / Remoting**：保留原有行为，连接 NameServer 并访问 Broker。旧连接未指定模式时继续使用此模式。
+- **Proxy / gRPC**：填写官方 RocketMQ 5.x Proxy 的 gRPC `host:port`，例如 `proxy.example.com:8081`。这不是 NameServer 端口，也不是 SOCKS5 代理地址。
+
+Proxy 默认启用 TLS 并验证服务端证书及主机名。连接本地明文 Proxy 时应明确关闭 TLS。SSH／SOCKS 网络转发应配置在连接的传输设置中，逻辑 Proxy 地址仍用于 TLS 主机名校验。
+
+AK/SK 使用连接认证中的 Basic 用户名／密码字段；不需要认证时选择无认证。凭据遵循连接的“保存密码”设置，不应在 `extra` 中重复填写 `secretKey`。
+
+配置示例（示例不包含真实凭据）：
+
+```json
+{
+  "systemKind": "rocketmq",
+  "adminUrl": "",
+  "auth": { "kind": "none" },
+  "extra": {
+    "connectionMode": "proxy",
+    "proxyEndpoint": "proxy.example.com:8081",
+    "proxyTls": true,
+    "managementEnabled": false
+  }
+}
+```
+
+仅配置 Proxy 时，控制台允许手动输入已存在的 Topic，发送普通消息及 Key、Tag、用户属性。普通消息由 Proxy 选择实际队列，回执不提供可确认的队列 ID，因此 DBX 不展示猜测的分区或分区内 Offset。连接测试检查消息通道，不发送或消费消息；测试成功不代表拥有每个 Topic 的发送权限。全局 Topic 列表、Broker、消费组、ACL、消息查询、Trace、按 Offset 预览不作为纯 Proxy 的功能提供。首期也不提供事务、定时、FIFO 消息或指定分区发送。
+
+需要管理集群时，可开启可选管理通道，再填写 NameServer 地址和集群名。消息仍通过 Proxy 发送，管理操作复用 Remoting；因此客户端还需要访问 NameServer 和 Broker。控制台分别展示消息与管理通道状态，管理通道失败时保留可用的消息发送功能。
+
+Proxy 模式需要支持 `rocketmq_proxy_grpc` 的 RocketMQ Agent。遇到升级提示时，在驱动管理中更新 RocketMQ 驱动；旧 Agent 仍可用于原有 Remoting 连接。
 
 ## 使用示例
 
@@ -354,7 +388,7 @@ async fn detect_pulsar_version(client: &reqwest::Client, base_url: &str) -> Puls
 
 ### 启用 MQ 功能
 ```bash
-# 默认已启用（default = ["duckdb-bundled", "mq-admin"]）
+# 默认已启用（default 包含 "duckdb-sidecar" 和 "mq-admin"）
 cargo build --release
 
 # 或显式指定
@@ -363,7 +397,7 @@ cargo build --release --features mq-admin
 
 ### 禁用 MQ 功能
 ```bash
-cargo build --release --no-default-features --features duckdb-bundled
+cargo build -p dbx --release --no-default-features --features duckdb-sidecar,sqlite-sqlcipher,system-fonts
 ```
 
 ### 检查编译
@@ -375,29 +409,100 @@ cargo check --package dbx-web --features mq-admin
 
 ## 后续扩展
 
-### 添加新的 MQ 系统（如 Kafka）
+### 添加新的 MQ 系统
 
-当前版本仅在架构和类型层预留 Kafka/RocketMQ；前端连接对话框不会提供这些选项。新增适配器并完成验证后，再开放 UI 选择。
+Kafka 使用 Java Agent，RocketMQ 使用 Go 原生 Agent；两者均通过 Rust 适配器接入。新增 MQ 系统时：
+
+1. 在 `agents/drivers/<name>/` 实现 JSON-RPC Agent（参考 `kafka` / `rocketmq`）
+2. 在 `crates/dbx-core/src/mq/adapters/` 实现 `MessageQueueAdmin`
+3. 在 `build_adapter()`、`agent_catalog`、`database-drivers.manifest.json` 注册
+4. 在前端连接对话框增加独立顶层入口（不要在内层 `mqSystem` 下拉合并类型）
+
+### RocketMQ 连接示例
+
+```json
+{
+  "db_type": "mq",
+  "driver_profile": "rocketmq",
+  "driver_label": "Apache RocketMQ",
+  "external_config": {
+    "systemKind": "rocketmq",
+    "adminUrl": "",
+    "auth": { "kind": "basic", "username": "accessKey", "password": "secretKey" },
+    "extra": {
+      "namesrvAddr": "127.0.0.1:9876",
+      "clusterName": "DefaultCluster"
+    }
+  }
+}
+```
+
+Agent 构建与安装：
+
+```bash
+cd agents/drivers/rocketmq
+CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o agent .
+# 将可执行文件安装到 DBX 数据目录 agents/drivers/rocketmq/agent
+```
+
+Docker 快速启动（NameServer 9876 + Broker 10911，仅用于本地验证）：
+
+```bash
+docker run -d --name dbx-rocketmq-namesrv -p 9876:9876 apache/rocketmq:5.3.1 sh mqnamesrv
+docker run -d --name dbx-rocketmq-broker -p 10911:10911 \
+  -e NAMESRV_ADDR=host.docker.internal:9876 \
+  apache/rocketmq:5.3.1 sh mqbroker -n host.docker.internal:9876
+```
+
+### RabbitMQ 连接示例
+
+```json
+{
+  "db_type": "mq",
+  "driver_profile": "rabbitmq",
+  "driver_label": "RabbitMQ",
+  "external_config": {
+    "systemKind": "rabbitmq",
+    "adminUrl": "",
+    "auth": { "kind": "basic", "username": "guest", "password": "guest" },
+    "extra": {
+      "addresses": "127.0.0.1:5672",
+      "virtualHost": "/"
+    }
+  }
+}
+```
+
+Agent 构建与安装：
+
+```bash
+cd agents
+cd drivers/rabbitmq
+go build -o agent .
+# 将原生 agent 安装到 DBX 数据目录 agents/drivers/rabbitmq/agent
+```
+
+Docker 快速启动（AMQP 5672 + Management 15672，仅用于本地验证）：
+
+```bash
+docker run -d --name dbx-rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+```
+
+说明：RabbitMQ 适配器将 topic 映射为队列（queue），支持队列列表/声明/删除、清空队列（purge）、消费者列表、消息预览（basic.get + requeue）与发送（basic.publish）；vhost 映射为 namespace，可在控制台查看/创建/删除。AMQP 操作按 vhost 透传（agent 侧 per-vhost 通道缓存），tenant 语义不适用（固定合成 `_rabbitmq`）。
+
+RabbitMQ 的 AMQP 监听端口与 Management HTTP 监听端口是独立配置。使用默认 AMQP 端口时可将 `adminUrl` 留空，由 DBX 使用默认 Management 端口；使用非默认 AMQP 端口时必须填写实际的 Management API URL，例如 AMQP 为 `127.0.0.1:5673`、Management 为 `http://127.0.0.1:15673`。SSH、SOCKS 或 HTTP 隧道会分别转发 AMQP 与 Management 两个端点。
+
+### Kafka 适配器参考
 
 1. 实现 `MessageQueueAdmin` trait：
 ```rust
 // crates/dbx-core/src/mq/adapters/kafka.rs
-pub struct KafkaAdapter {
-    config: Arc<ConnectionConfig>,
-    client: KafkaAdminClient,
-}
+pub struct KafkaAdmin { /* ... */ }
 
 #[async_trait]
-impl MessageQueueAdmin for KafkaAdapter {
-    async fn test_connection(&self) -> Result<MqClusterInfo, String> {
-        // Kafka 特定的连接测试
-    }
-    
-    async fn list_topics(&self, ns: &NamespaceRef, opts: ListTopicsOpts) -> Result<Vec<TopicInfo>, String> {
-        // Kafka 使用不同的 topic 模型，适配到统一接口
-    }
-    
-    // ... 实现其他方法
+impl MessageQueueAdmin for KafkaAdmin {
+    async fn test_connection(&self) -> Result<MqClusterInfo, String> { /* ... */ }
+    async fn list_topics(&self, ns: &NamespaceRef, opts: ListTopicsOpts) -> Result<Vec<TopicInfo>, String> { /* ... */ }
 }
 ```
 
@@ -405,10 +510,8 @@ impl MessageQueueAdmin for KafkaAdapter {
 ```rust
 match mq_config.system_kind {
     MqSystemKind::Pulsar => { /* ... */ }
-    MqSystemKind::Kafka => {
-        Ok(Arc::new(KafkaAdapter::new(config.clone()).await?))
-    }
-    // ...
+    MqSystemKind::Kafka => { /* ... */ }
+    MqSystemKind::RocketMq => { /* ... */ }
 }
 ```
 
@@ -439,5 +542,3 @@ const response = await mqRawRequest(connectionId, {
 })
 console.log(response.body)
 ```
-
- 

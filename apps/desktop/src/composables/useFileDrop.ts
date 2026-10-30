@@ -1,16 +1,16 @@
 import { useI18n } from "vue-i18n";
-import { uuid } from "@/lib/utils";
-import { isTauriRuntime } from "@/lib/tauriRuntime";
+import { uuid } from "@/lib/common/utils";
+import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
+import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
-import * as api from "@/lib/api";
-import type { ConnectionConfig } from "@/types/database";
-import { detectDatabaseFileType } from "@/lib/databaseFileDetection";
-
-function isSqlFilePath(path: string): boolean {
-  return /\.sql$/i.test(path);
-}
+import { useLargeSqlFileStreamingFallback } from "@/composables/useLargeSqlFileFallback";
+import * as api from "@/lib/backend/api";
+import type { ConnectionConfig, ExternalSqlFileVersion } from "@/types/database";
+import { detectDatabaseFileType } from "@/lib/database/databaseFileDetection";
+import { externalSqlEditorMaxBytes, externalSqlFileOpenErrorMessage, isScriptFilePath, isSqlFilePath, readBrowserSqlFile } from "@/lib/sql/sqlFileOpen";
+import { activeTabExternalSqlFileTarget, resolveExternalSqlFileTargetForActiveTab } from "@/lib/sql/externalSqlFileTarget";
 
 function getDataFileQuery(path: string): Promise<string | undefined> {
   return api.buildDroppedFilePreviewSql({ path });
@@ -20,15 +20,24 @@ export function useFileDrop() {
   const { t } = useI18n();
   const connectionStore = useConnectionStore();
   const queryStore = useQueryStore();
+  const settingsStore = useSettingsStore();
   const { toast } = useToast();
+  const { openInStreamingExecutorOnTooLarge } = useLargeSqlFileStreamingFallback();
 
-  async function openDroppedSqlFile(name: string, content: string, path?: string) {
-    const connectionId = connectionStore.activeConnectionId || connectionStore.connections[0]?.id || "";
-    const connection = connectionId ? connectionStore.getConfig(connectionId) : undefined;
-    const database = connection?.database || "";
-    const tabId = queryStore.createTab(connectionId, database, name, "query");
-    queryStore.updateSql(tabId, content);
-    if (path) queryStore.linkExternalSqlPath(tabId, path, name);
+  async function openDroppedSqlFile(name: string, content: string, path?: string, version?: ExternalSqlFileVersion, encoding?: import("@/types/database").QueryTab["externalSqlEncoding"]) {
+    const options = { allowMongoScripts: !isSqlFilePath(name) };
+    const target = path
+      ? resolveExternalSqlFileTargetForActiveTab(path, queryStore.tabs, queryStore.activeTabId, (connectionId) => connectionStore.getConfig(connectionId), options)
+      : activeTabExternalSqlFileTarget(queryStore.tabs, queryStore.activeTabId, (connectionId) => connectionStore.getConfig(connectionId), options);
+    // Dropped .js files only open when they resolve to a MongoDB target so they
+    // never bind to a relational SQL tab.
+    if (!isSqlFilePath(name) && connectionStore.getConfig(target.connectionId)?.db_type !== "mongodb") return;
+    if (path) {
+      queryStore.openExternalSqlFile(target.connectionId, target.database, path, content, version, target.catalog, target.schema, undefined, encoding);
+    } else {
+      const tabId = queryStore.createTab(target.connectionId, target.database, name, "query", target.schema, undefined, target.catalog);
+      queryStore.updateSql(tabId, content);
+    }
     toast(t("welcome.fileOpened", { name }));
   }
 
@@ -37,7 +46,13 @@ export function useFileDrop() {
       const { getCurrentWebview } = await import("@tauri-apps/api/webview");
       const webview = getCurrentWebview();
       await webview.onDragDropEvent(async (event) => {
+        const routedEvent = new CustomEvent("dbx:tauri-file-drop", {
+          detail: event.payload,
+          cancelable: true,
+        });
+        const handledByPanel = !document.dispatchEvent(routedEvent);
         if (event.payload.type !== "drop") return;
+        if (handledByPanel) return;
         for (const path of event.payload.paths) {
           const name = path.split("/").pop()?.split("\\").pop() || path;
 
@@ -54,8 +69,15 @@ export function useFileDrop() {
               port: 0,
               username: "",
               password: "",
+              one_time: true,
             };
-            const connectionId = await api.connectDb(config);
+            let connectionId: string;
+            try {
+              connectionId = await api.connectDb(config);
+            } catch (e: any) {
+              toast(t("welcome.fileOpenFailed", { name, message: e?.message || String(e) }), 5000);
+              continue;
+            }
             connectionStore.addEphemeralConnection({ ...config, id: connectionId });
             const tabId = queryStore.createTab(connectionId, "", name, "query");
             queryStore.updateSql(tabId, dataQuery);
@@ -64,12 +86,14 @@ export function useFileDrop() {
             continue;
           }
 
-          if (isSqlFilePath(path)) {
+          if (isScriptFilePath(path)) {
             try {
-              const content = await api.readExternalSqlFile(path);
-              await openDroppedSqlFile(name, content, path);
+              const snapshot = await api.readExternalSqlFileSnapshot(path, externalSqlEditorMaxBytes(settingsStore.editorSettings.externalSqlEditorMaxMb));
+              await openDroppedSqlFile(name, snapshot.content, path, snapshot.version, snapshot.encoding);
             } catch (e: any) {
-              toast(t("toolbar.sqlOpenFailed", { message: e?.message || String(e) }), 5000);
+              if (!openInStreamingExecutorOnTooLarge(path, e)) {
+                toast(t("toolbar.sqlOpenFailed", { message: externalSqlFileOpenErrorMessage(e, (key, params) => t(key, params)) }), 5000);
+              }
             }
             continue;
           }
@@ -90,37 +114,33 @@ export function useFileDrop() {
           };
           try {
             await connectionStore.addConnection(config);
-            void connectionStore.connect(config);
+            await connectionStore.connect(config);
             toast(t("welcome.fileOpened", { name }));
           } catch (e: any) {
-            toast(t("connection.saveFailed", { message: e?.message || String(e) }), 5000);
+            toast(t("welcome.fileOpenFailed", { name, message: e?.message || String(e) }), 5000);
           }
         }
       });
     } else {
-      document.addEventListener("drop", (event: DragEvent) => {
+      document.addEventListener("drop", (event) => {
         const files = event.dataTransfer?.files;
         if (!files || files.length === 0) return;
         event.preventDefault();
         for (let i = 0; i < files.length; i++) {
           const file = files[i];
-          if (!isSqlFilePath(file.name)) continue;
-          const reader = new FileReader();
-          reader.onload = () => {
-            if (typeof reader.result === "string") {
-              openDroppedSqlFile(file.name, reader.result).catch((e: any) => {
-                toast(t("toolbar.sqlOpenFailed", { message: e?.message || String(e) }), 5000);
-              });
-            }
-          };
-          reader.readAsText(file);
+          if (!isScriptFilePath(file.name)) continue;
+          void readBrowserSqlFile(file, externalSqlEditorMaxBytes(settingsStore.editorSettings.externalSqlEditorMaxMb))
+            .then((content) => openDroppedSqlFile(file.name, content))
+            .catch((e: any) => {
+              toast(t("toolbar.sqlOpenFailed", { message: externalSqlFileOpenErrorMessage(e, (key, params) => t(key, params)) }), 5000);
+            });
         }
       });
-      document.addEventListener("dragover", (event: DragEvent) => {
+      document.addEventListener("dragover", (event) => {
         const files = event.dataTransfer?.files;
         if (!files || files.length === 0) return;
         for (let i = 0; i < files.length; i++) {
-          if (isSqlFilePath(files[i].name)) {
+          if (isScriptFilePath(files[i].name)) {
             event.preventDefault();
             return;
           }

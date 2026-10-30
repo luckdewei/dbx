@@ -3,27 +3,31 @@ import { computed, ref, watch } from "vue";
 import { Settings2 } from "@lucide/vue";
 import type { AiProvider } from "@/stores/settingsStore";
 import { useTheme } from "@/composables/useTheme";
+import { webPath } from "@/lib/common/webPath";
 
 const props = defineProps<{
   provider: AiProvider;
   label: string;
   iconSlug?: string;
+  iconPath?: string;
 }>();
 
 const failed = ref(false);
 const { isDark } = useTheme();
 
-watch(
-  () => props.iconSlug,
-  () => {
-    failed.value = false;
-  },
-);
+watch([() => props.iconSlug, () => props.iconPath], () => {
+  failed.value = false;
+});
 
-const usesWhiteDarkIcon = computed(() => props.provider === "claude" || props.provider === "ollama" || props.provider === "openai" || props.provider === "openai-compatible");
+const usesWhiteDarkIcon = computed(
+  () =>
+    !props.iconPath &&
+    (props.provider === "claude" || props.provider === "anthropic-compatible" || props.provider === "ollama" || props.provider === "openai" || props.provider === "openai-compatible" || props.provider === "opencode-cli" || props.provider === "cursor-cli" || props.provider === "grok-cli"),
+);
 const localIconUrl = computed(() => {
-  if (props.provider === "openai-compatible") return "/icons/ai/openai.svg";
-  return props.iconSlug ? `/icons/ai/${props.iconSlug}.svg` : "";
+  if (props.iconPath) return webPath(props.iconPath);
+  if (props.provider === "openai-compatible") return webPath("/icons/ai/openai.svg");
+  return props.iconSlug ? webPath(`/icons/ai/${props.iconSlug}.svg`) : "";
 });
 const fallbackText = computed(() => {
   if (props.provider === "openai-compatible") return "OC";

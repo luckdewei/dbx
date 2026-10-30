@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use dbx_core::data_grid_sql::{
-    build_data_grid_copy_insert_statement, DataGridColumnInfo, DataGridCopyInsertStatementOptions, DataGridTableMeta,
+    build_data_grid_copy_insert_statement, DataGridColumnInfo, DataGridCopyInsertMode,
+    DataGridCopyInsertStatementOptions, DataGridTableMeta,
 };
 use dbx_core::database_export::{build_export_insert_statements, BuildExportInsertStatementsOptions};
 use dbx_core::db::postgres;
@@ -60,6 +61,8 @@ async fn postgres_tsvector_generated_columns_are_readable_and_omitted_from_inser
     assert!(search_vector.extra.as_deref().unwrap_or_default().contains("generated always as"));
 
     let table_meta = DataGridTableMeta {
+        catalog: None,
+        database: None,
         schema: Some(schema.clone()),
         table_name: "articles".to_string(),
         primary_keys: vec!["id".to_string()],
@@ -67,11 +70,16 @@ async fn postgres_tsvector_generated_columns_are_readable_and_omitted_from_inser
     };
     let copy_insert = build_data_grid_copy_insert_statement(DataGridCopyInsertStatementOptions {
         database_type: Some(DatabaseType::Postgres),
+        identifier_quote: None,
         table_meta: Some(table_meta),
         columns: result.columns.clone(),
+        column_types: None,
         source_columns: None,
         rows: result.rows.clone(),
-        exclude_primary_keys: false,
+        primary_key_mode: dbx_core::data_grid_sql::DataGridPrimaryKeyMode::Include,
+        include_computed_columns: false,
+        include_database_name: true,
+        insert_mode: DataGridCopyInsertMode::Merged,
     })
     .expect("copy insert");
     assert!(copy_insert.contains("\"id\", \"title\", \"body\""));
@@ -79,13 +87,18 @@ async fn postgres_tsvector_generated_columns_are_readable_and_omitted_from_inser
 
     let export_insert = build_export_insert_statements(BuildExportInsertStatementsOptions {
         database_type: Some(DatabaseType::Postgres),
+        identifier_quote: None,
         schema: Some(schema.clone()),
         table_name: Some("articles".to_string()),
         qualified_table_name: None,
         columns: result.columns.clone(),
         column_types: result.column_types.iter().map(|value| Some(value.clone())).collect(),
+        column_extras: Vec::new(),
+        spatial_columns: Vec::new(),
+        spatial_values: Vec::new(),
         rows: result.rows.clone(),
         batch_size: Some(10),
+        preserve_original_language: false,
     })
     .expect("export insert")
     .join("\n");

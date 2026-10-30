@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, nextTick, onBeforeUnmount } from "vue";
 import { useI18n } from "vue-i18n";
-import * as api from "@/lib/api";
+import * as api from "@/lib/backend/api";
 import { useToast } from "@/composables/useToast";
 
 const props = defineProps<{
@@ -34,6 +34,8 @@ let nextId = 0;
 let ws: WebSocket | null = null;
 const connected = ref(false);
 const connecting = ref(false);
+let connectAttempt = 0;
+let disposed = false;
 
 const messagesContainer = ref<HTMLElement | null>(null);
 
@@ -62,24 +64,32 @@ function addMessage(channel: string, pattern: string | null, payload: string) {
 
 // Connect WebSocket
 async function connect() {
-  if (ws && ws.readyState === WebSocket.OPEN) return;
+  if (disposed || connecting.value || (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING))) return;
+  const attempt = ++connectAttempt;
   connecting.value = true;
   try {
-    ws = api.redisPubSubConnect(props.connectionId);
+    const socket = await api.redisPubSubConnect(props.connectionId);
+    if (disposed || attempt !== connectAttempt) {
+      socket.close();
+      return;
+    }
+    ws = socket;
 
-    ws.onopen = () => {
+    socket.onopen = () => {
+      if (ws !== socket) return;
       connected.value = true;
       connecting.value = false;
       // Re-subscribe existing channels
       if (channels.value.length > 0) {
-        ws!.send(JSON.stringify({ type: "subscribe", channels: channels.value }));
+        socket.send(JSON.stringify({ type: "subscribe", channels: channels.value }));
       }
       if (patterns.value.length > 0) {
-        ws!.send(JSON.stringify({ type: "psubscribe", patterns: patterns.value }));
+        socket.send(JSON.stringify({ type: "psubscribe", patterns: patterns.value }));
       }
     };
 
-    ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
+      if (ws !== socket) return;
       try {
         const data = JSON.parse(event.data as string);
         if (data.error) {
@@ -92,29 +102,34 @@ async function connect() {
       }
     };
 
-    ws.onclose = () => {
+    socket.onclose = () => {
+      if (ws !== socket) return;
       connected.value = false;
       connecting.value = false;
       ws = null;
     };
 
-    ws.onerror = () => {
+    socket.onerror = () => {
+      if (ws !== socket) return;
       connected.value = false;
       connecting.value = false;
       ws = null;
+      socket.close();
     };
   } catch (e) {
+    if (attempt !== connectAttempt || disposed) return;
     connecting.value = false;
     toast(t("redis.pubsubWsConnectFailed", { error: e instanceof Error ? e.message : String(e) }), 5000);
   }
 }
 
 function disconnect() {
-  if (ws) {
-    ws.close();
-    ws = null;
-    connected.value = false;
-  }
+  connectAttempt += 1;
+  const socket = ws;
+  ws = null;
+  connected.value = false;
+  connecting.value = false;
+  if (socket) socket.close();
 }
 
 function subscribe() {
@@ -159,11 +174,6 @@ async function publish() {
   if (!ch || !msg) return;
   try {
     await api.redisPubSubPublish(props.connectionId, props.db, ch, msg);
-    // Echo locally only if subscribed — Redis PubSub doesn't deliver to publisher
-    const isSubscribed = channels.value.includes(ch) || patterns.value.some((p) => new RegExp("^" + p.replace(/\*/g, ".*") + "$").test(ch));
-    if (isSubscribed) {
-      addMessage(ch, null, msg);
-    }
     publishMessage.value = "";
   } catch (e) {
     toast(t("redis.pubsubPublishFailed", { error: e instanceof Error ? e.message : String(e) }), 3000);
@@ -175,6 +185,7 @@ function clearMessages() {
 }
 
 onBeforeUnmount(() => {
+  disposed = true;
   disconnect();
 });
 </script>

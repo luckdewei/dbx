@@ -1,6 +1,6 @@
 package com.dbx.agent.access;
 
-import com.dbx.agent.BaseDatabaseAgent;
+import com.dbx.agent.AbstractJdbcAgent;
 import com.dbx.agent.ColumnInfo;
 import com.dbx.agent.ConnectParams;
 import com.dbx.agent.DatabaseInfo;
@@ -8,7 +8,7 @@ import com.dbx.agent.ExecuteQueryOptions;
 import com.dbx.agent.ForeignKeyInfo;
 import com.dbx.agent.IndexInfo;
 import com.dbx.agent.JdbcExecutor;
-import com.dbx.agent.JsonRpcServer;
+import com.dbx.agent.MultiSessionJsonRpcServer;
 import com.dbx.agent.ObjectInfo;
 import com.dbx.agent.QueryResult;
 import com.dbx.agent.TableInfo;
@@ -29,38 +29,32 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
-public final class AccessAgent extends BaseDatabaseAgent {
-    private Connection connection;
+public final class AccessAgent extends AbstractJdbcAgent {
+    private static final String ENCRYPTED_ACCESS_OPENER = EncryptedAccessOpener.class.getName();
     private String databaseFile = "";
 
     @Override
-    public Connection getConnection() {
-        return connection;
+    protected String driverClass() {
+        return "net.ucanaccess.jdbc.UcanaccessDriver";
     }
 
     @Override
-    public void connect(ConnectParams params) {
-        uncheckedVoid(() -> {
-            Class.forName("net.ucanaccess.jdbc.UcanaccessDriver");
-            String file = databasePath(params);
-            String url = jdbcUrl(params, true);
-            connection = DriverManager.getConnection(url, params.getUsername(), params.getPassword());
-            databaseFile = file;
-        });
+    protected String buildJdbcUrl(ConnectParams params) {
+        return jdbcUrl(params, true);
     }
 
     @Override
-    public boolean testConnection(ConnectParams params) {
-        return unchecked(() -> {
-            Class.forName("net.ucanaccess.jdbc.UcanaccessDriver");
-            String file = databasePath(params);
-            if (file.isBlank() || !Files.exists(Path.of(file))) {
-                return false;
-            }
-            try (Connection conn = DriverManager.getConnection(jdbcUrl(params, false), params.getUsername(), params.getPassword())) {
-                return conn.isValid(5);
-            }
-        });
+    protected Connection openTestConnection(ConnectParams params) throws Exception {
+        String file = databasePath(params);
+        if (file.isBlank() || !Files.exists(Path.of(file))) {
+            return null;
+        }
+        return DriverManager.getConnection(jdbcUrl(params, false), params.getUsername(), params.getPassword());
+    }
+
+    @Override
+    protected void afterConnect(ConnectParams params, Connection connection) {
+        databaseFile = databasePath(params);
     }
 
     @Override
@@ -103,7 +97,7 @@ public final class AccessAgent extends BaseDatabaseAgent {
     public List<ObjectInfo> listObjects(String schema) {
         List<ObjectInfo> result = new ArrayList<>();
         for (TableInfo table : listTables(schema)) {
-            result.add(new ObjectInfo(table.getName(), table.getTable_type(), null, table.getComment()));
+            result.add(new ObjectInfo(table.getName(), table.getTable_type(), null, table.getComment(), table.getValid()));
         }
         return result;
     }
@@ -216,7 +210,7 @@ public final class AccessAgent extends BaseDatabaseAgent {
 
     @Override
     public QueryResult executeQuery(String sql, String schema, ExecuteQueryOptions options) {
-        return JdbcExecutor.INSTANCE.execute(
+        return JdbcExecutor.current().execute(
             requireConnected(),
             sql,
             schema,
@@ -224,23 +218,13 @@ public final class AccessAgent extends BaseDatabaseAgent {
             options.getMaxRows(),
             options.getFetchSize(),
             options.getTimeoutSecs(),
-            JdbcExecutor.INSTANCE::defaultResultValue
+            JdbcExecutor.current()::defaultResultValue
         );
     }
 
     @Override
     public String setSchemaSQL(String schema) {
         return "";
-    }
-
-    @Override
-    public void disconnect() {
-        uncheckedVoid(() -> {
-            if (connection != null) {
-                connection.close();
-            }
-            connection = null;
-        });
     }
 
     private Set<String> primaryKeyColumns(DatabaseMetaData meta, String table) throws Exception {
@@ -284,6 +268,11 @@ public final class AccessAgent extends BaseDatabaseAgent {
             rawUrl = "jdbc:ucanaccess://" + databasePath(params);
         }
         rawUrl = appendUCanAccessParams(rawUrl, params.getUrl_params());
+
+        // The codec opener is safe for regular files and enables encrypted Access files when a password is supplied.
+        if (!containsIgnoreCase(rawUrl, "jackcessOpener=")) {
+            rawUrl += (rawUrl.endsWith(";") ? "" : ";") + "jackcessOpener=" + ENCRYPTED_ACCESS_OPENER;
+        }
 
         if (!createIfMissing || Files.exists(Path.of(databasePath(params)))) {
             return rawUrl;
@@ -361,6 +350,6 @@ public final class AccessAgent extends BaseDatabaseAgent {
     }
 
     public static void main(String[] args) {
-        new JsonRpcServer(new AccessAgent()).run();
+        new MultiSessionJsonRpcServer(AccessAgent::new).run();
     }
 }

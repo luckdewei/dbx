@@ -2,7 +2,7 @@
 import type { Component, HTMLAttributes } from "vue";
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { Check, ChevronDown } from "@lucide/vue";
-import { cn } from "@/lib/utils";
+import { cn } from "@/lib/common/utils";
 
 export interface LightDropdownMenuItem {
   label: string;
@@ -16,6 +16,12 @@ export interface LightDropdownMenuItem {
   separatorBefore?: boolean;
   destructive?: boolean;
   checked?: boolean;
+  /**
+   * Single-select menus can opt into radio semantics so assistive tech announces
+   * the active option. Defaults to a plain `menuitem`, which keeps every
+   * existing caller's markup unchanged.
+   */
+  role?: "menuitem" | "menuitemradio" | "menuitemcheckbox";
   closeOnSelect?: boolean;
   onSelect?: () => void;
 }
@@ -67,7 +73,7 @@ const props = withDefaults(
     sideOffset: 4,
     matchTriggerWidth: true,
     closeOnSelect: true,
-    triggerClass: "flex h-6 items-center gap-1 rounded-full border border-border bg-background px-2 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-50 aria-expanded:bg-muted aria-expanded:text-foreground",
+    triggerClass: "flex h-6 items-center gap-1 rounded-md border border-border bg-background px-2 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-50 aria-expanded:bg-muted aria-expanded:text-foreground",
     triggerIconClass: "h-3 w-3",
     contentClass: "",
     labelClass: "",
@@ -194,7 +200,7 @@ function onKeydown(event: KeyboardEvent) {
 }
 
 function menuItems() {
-  return Array.from(menuRef.value?.querySelectorAll<HTMLButtonElement>("[role='menuitem']:not(:disabled)") ?? []);
+  return Array.from(menuRef.value?.querySelectorAll<HTMLButtonElement>("[role='menuitem']:not(:disabled), [role='menuitemradio']:not(:disabled), [role='menuitemcheckbox']:not(:disabled)") ?? []);
 }
 
 function focusMenuItem(direction: 1 | -1) {
@@ -260,7 +266,7 @@ watch(
     <div
       v-if="isOpen"
       ref="menuRef"
-      class="ring-foreground/10 fixed z-50 max-h-(--reka-dropdown-menu-content-available-height) min-w-32 overflow-x-hidden overflow-y-auto rounded-lg p-1 ring-1 cn-menu-translucent text-popover-foreground"
+      class="ring-foreground/10 fixed z-(--dbx-floating-layer-z-index) max-h-(--reka-dropdown-menu-content-available-height) min-w-32 overflow-x-hidden overflow-y-auto rounded-md p-1 ring-1 cn-menu-translucent text-popover-foreground"
       :class="cn(matchTriggerWidth ? 'w-(--reka-dropdown-menu-trigger-width)' : '', contentClass)"
       :style="menuStyle"
       role="menu"
@@ -279,7 +285,8 @@ watch(
             "
             :disabled="item.disabled"
             :title="item.title"
-            role="menuitem"
+            :role="item.role ?? 'menuitem'"
+            :aria-checked="item.role === 'menuitemradio' || item.role === 'menuitemcheckbox' ? itemIsSelected(item) : undefined"
             @click="selectItem(item)"
           >
             <Check v-if="checkPosition === 'left'" class="h-3 w-3 shrink-0" :class="itemIsSelected(item) ? selectedCheckClass : 'opacity-0'" />

@@ -1,19 +1,21 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from "vue";
+import { ref, computed, watch, onMounted, nextTick } from "vue";
 import { useI18n } from "vue-i18n";
 import { AlignLeft, Copy, ChevronDown, Undo2, Redo2 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 import { useTheme } from "@/composables/useTheme";
 import { useToast } from "@/composables/useToast";
-import { copyToClipboard } from "@/lib/clipboard";
-import { formatSqlText, type SqlFormatDialect } from "@/lib/sqlFormatter";
-import type { Highlighter } from "shiki";
+import { copyToClipboard, isPlainClipboardShortcut } from "@/lib/common/clipboard";
+import { formatSqlText, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
+import { createShikiSqlHighlighter, type SqlHighlighter } from "@/lib/sql/sqlHighlighter";
+import { useSettingsStore } from "@/stores/settingsStore";
 
 const props = defineProps<{
   sql: string;
   sqlFormatDialect?: SqlFormatDialect;
   loading?: boolean;
+  emptyMessage?: string;
   canUndo?: boolean;
   canRedo?: boolean;
 }>();
@@ -27,6 +29,7 @@ const emit = defineEmits<{
 const { t } = useI18n();
 const { isDark } = useTheme();
 const { toast } = useToast();
+const settingsStore = useSettingsStore();
 
 const isFormatted = ref(false);
 const formattedSql = ref("");
@@ -34,7 +37,7 @@ const formatting = ref(false);
 const highlightedHtml = ref("");
 const highlighterReady = ref(false);
 
-let highlighter: Highlighter | null = null;
+let highlighter: SqlHighlighter | null = null;
 
 const displaySql = computed(() => {
   if (isFormatted.value && formattedSql.value) {
@@ -45,13 +48,62 @@ const displaySql = computed(() => {
 
 const hasSql = computed(() => props.sql.trim().length > 0);
 
+const contentRef = ref<HTMLPreElement | null>(null);
+
+function selectPreviewContent() {
+  const el = contentRef.value;
+  if (!el) return false;
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  const selection = window.getSelection();
+  selection?.removeAllRanges();
+  selection?.addRange(range);
+  return true;
+}
+
+/** Text the user actually highlighted inside the preview, if any. */
+function selectedPreviewText(): string {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) return "";
+  const el = contentRef.value;
+  if (!el) return "";
+  // Only a selection that lives inside this preview counts; one leaked from the
+  // surrounding grid must not be copied as if it were the preview text.
+  for (let index = 0; index < selection.rangeCount; index += 1) {
+    const range = selection.getRangeAt(index);
+    if (!el.contains(range.commonAncestorContainer)) return "";
+  }
+  return selection.toString();
+}
+
+async function copySelectionOrAll(event: KeyboardEvent) {
+  const text = selectedPreviewText() || displaySql.value;
+  if (!text.trim()) return;
+  event.preventDefault();
+  event.stopPropagation();
+  await copyPreviewText(text);
+}
+
+function onContentKeydown(event: KeyboardEvent) {
+  if (isPlainClipboardShortcut(event, "a")) {
+    // Claim the shortcut before it reaches the surrounding data grid, then select
+    // the preview text instead of the grid cells.
+    if (selectPreviewContent()) event.preventDefault();
+    return;
+  }
+  // A programmatically built selection (Ctrl+A above) is not guaranteed to reach
+  // the system clipboard through the webview's native copy, so copy it through the
+  // app clipboard instead: the toast already claimed success that never happened
+  // (#12167).
+  if (isPlainClipboardShortcut(event, "c")) void copySelectionOrAll(event);
+}
+
 async function initHighlighter() {
   if (highlighter) return;
   try {
-    const { createHighlighter } = await import("shiki");
-    highlighter = await createHighlighter({
-      themes: ["dark-plus", "min-light"],
-      langs: ["sql"],
+    highlighter = await createShikiSqlHighlighter({
+      appearance: () => (isDark.value ? "dark" : "light"),
+      themePreset: "preview",
     });
     highlighterReady.value = true;
     await highlightSql();
@@ -63,11 +115,7 @@ async function initHighlighter() {
 async function highlightSql() {
   if (!highlighter || !displaySql.value) return;
   try {
-    const theme = isDark.value ? "dark-plus" : "min-light";
-    highlightedHtml.value = highlighter.codeToHtml(displaySql.value, {
-      lang: "sql",
-      theme,
-    });
+    highlightedHtml.value = highlighter(displaySql.value);
   } catch {
     // fallback to plain text
     highlightedHtml.value = "";
@@ -84,8 +132,12 @@ async function toggleFormat() {
 
   formatting.value = true;
   try {
-    formattedSql.value = await formatSqlText(props.sql, props.sqlFormatDialect ?? "generic");
+    let diagnostic: "custom-rules-fallback" | undefined;
+    formattedSql.value = await formatSqlText(props.sql, props.sqlFormatDialect ?? "generic", settingsStore.editorSettings.sqlFormatter, (value) => {
+      diagnostic = value;
+    });
     isFormatted.value = true;
+    if (diagnostic === "custom-rules-fallback") toast(t("settings.sqlFormatterFallbackNotice"), 4000);
     await highlightSql();
   } catch {
     toast(t("toolbar.formatSqlFailed"), 3000);
@@ -97,6 +149,10 @@ async function toggleFormat() {
 async function handleCopy() {
   const text = displaySql.value;
   if (!text.trim()) return;
+  await copyPreviewText(text);
+}
+
+async function copyPreviewText(text: string) {
   try {
     await copyToClipboard(text);
     toast(t("grid.copied"));
@@ -132,12 +188,6 @@ onMounted(() => {
   nextTick(() => {
     void initHighlighter();
   });
-});
-
-onBeforeUnmount(() => {
-  highlighter?.dispose();
-  highlighter = null;
-  highlighterReady.value = false;
 });
 </script>
 
@@ -198,14 +248,14 @@ onBeforeUnmount(() => {
 
       <!-- Empty -->
       <div v-else-if="!hasSql" class="flex items-center justify-center h-full text-xs text-muted-foreground">
-        {{ t("grid.previewSqlEmpty") }}
+        {{ emptyMessage || t("grid.previewSqlEmpty") }}
       </div>
 
       <!-- Shiki highlighted SQL -->
-      <div v-else-if="highlightedHtml" data-native-clipboard class="p-3 text-xs leading-relaxed [&_pre]:!bg-transparent [&_pre]:!p-0 [&_code]:!font-mono [&_code]:text-xs" v-html="highlightedHtml" />
+      <pre v-else-if="highlightedHtml" ref="contentRef" data-native-clipboard tabindex="0" class="m-0 p-3 text-xs font-mono leading-relaxed whitespace-pre-wrap break-words select-text outline-none" v-html="highlightedHtml" @keydown="onContentKeydown"></pre>
 
       <!-- Plain text fallback -->
-      <pre v-else data-native-clipboard class="p-3 text-xs font-mono whitespace-pre-wrap select-text">{{ displaySql }}</pre>
+      <pre v-else ref="contentRef" data-native-clipboard tabindex="0" class="p-3 text-xs font-mono whitespace-pre-wrap select-text outline-none" @keydown="onContentKeydown">{{ displaySql }}</pre>
     </div>
   </div>
 </template>

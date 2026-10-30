@@ -1,7 +1,13 @@
 import { spawn } from "node:child_process";
 import { performance } from "node:perf_hooks";
+import { delimiter, join } from "node:path";
 
 const tasks = [
+  {
+    name: "connection-types",
+    command: "node",
+    args: ["scripts/sync-connection-types.mjs", "--check"],
+  },
   {
     name: "format",
     command: "oxfmt",
@@ -10,7 +16,7 @@ const tasks = [
   {
     name: "lint",
     command: "oxlint",
-    args: ["--vue-plugin", "apps/desktop/src"],
+    args: ["--vue-plugin", "apps/desktop/src", "--max-warnings=61"],
   },
   {
     name: "typecheck",
@@ -26,9 +32,10 @@ const tasks = [
 
 function runTask(task) {
   const startedAt = performance.now();
-  const child = spawn(task.command, task.args, {
+  const command = commandSpec(task);
+  const child = spawn(command.program, command.args, {
     cwd: process.cwd(),
-    env: process.env,
+    env: commandEnv(task),
     stdio: ["ignore", "pipe", "pipe"],
   });
   const stdout = [];
@@ -58,6 +65,25 @@ function runTask(task) {
       });
     });
   });
+}
+
+function commandSpec(task) {
+  if (process.platform !== "win32") return { program: task.command, args: task.args };
+  const command = join(process.cwd(), "node_modules", ".bin", `${task.command}.CMD`);
+  return { program: "cmd.exe", args: ["/d", "/c", "call", command, ...task.args] };
+}
+
+function commandEnv(task) {
+  const env = {
+    ...process.env,
+    PATH: [join(process.cwd(), "node_modules", ".bin"), process.env.PATH].filter(Boolean).join(delimiter),
+  };
+  // vue-tsc's full application graph exceeds Node's default 4 GiB heap.
+  // Keep this allowance scoped to typechecking and respect explicit limits.
+  if (task.name === "typecheck" && !/--max[-_]old[-_]space[-_]size(?:=|\s)/.test(env.NODE_OPTIONS ?? "")) {
+    env.NODE_OPTIONS = [env.NODE_OPTIONS, "--max-old-space-size=8192"].filter(Boolean).join(" ");
+  }
+  return env;
 }
 
 function outputFailureExcerpt(output) {

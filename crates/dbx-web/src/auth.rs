@@ -33,12 +33,55 @@ pub struct AuthCheckResponse {
 const MAX_ATTEMPTS: u32 = 5;
 const LOCKOUT_SECS: u64 = 60;
 
+fn session_cookie_path(state: &WebState) -> &str {
+    state.public_base_path.as_str()
+}
+
+/// `Secure` is opt-in: LAN/HTTP deployments would otherwise never receive the
+/// session cookie back. Reverse-proxy TLS deployments set DBX_WEB_COOKIE_SECURE=1.
+fn cookie_secure_enabled() -> bool {
+    static SECURE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SECURE.get_or_init(|| matches!(std::env::var("DBX_WEB_COOKIE_SECURE").ok().as_deref(), Some("1") | Some("true")))
+}
+
+pub(crate) fn session_cookie(state: &WebState, token: &str) -> String {
+    let secure = if cookie_secure_enabled() { "; Secure" } else { "" };
+    format!("dbx_session={token}; Path={}; HttpOnly; SameSite=Lax{secure}", session_cookie_path(state))
+}
+
+fn api_path_suffix<'a>(path: &'a str, public_base_path: &str) -> Option<&'a str> {
+    if let Some(suffix) = path.strip_prefix("/api/") {
+        return Some(suffix);
+    }
+    let base = public_base_path.trim_end_matches('/');
+    if base.is_empty() || base == "/" {
+        return None;
+    }
+    path.strip_prefix(base)?.strip_prefix("/api/")
+}
+
+pub(crate) fn middleware_api_path_suffix<'a>(path: &'a str, public_base_path: &str) -> Option<&'a str> {
+    if let Some(suffix) = api_path_suffix(path, public_base_path) {
+        return Some(suffix);
+    }
+
+    let base = public_base_path.trim_end_matches('/');
+    if !base.is_empty() && base != "/" && path.strip_prefix(base).is_some() {
+        return None;
+    }
+
+    path.strip_prefix('/').filter(|suffix| !suffix.is_empty())
+}
+
 pub async fn login(State(state): State<Arc<WebState>>, Json(body): Json<LoginRequest>) -> Result<Response, StatusCode> {
     let hash_guard = state.password_hash.read().await;
     let hash_str = match hash_guard.as_deref() {
+        // No password configured: nothing to authenticate against. Answer
+        // explicitly instead of an ok:true that reads as "authenticated" —
+        // the API remains locked by the middleware until setup completes.
         Some(h) => h.to_string(),
         None => {
-            return Ok((StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response());
+            return Ok((StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "setup_required"}))).into_response());
         }
     };
     drop(hash_guard);
@@ -51,7 +94,7 @@ pub async fn login(State(state): State<Arc<WebState>>, Json(body): Json<LoginReq
                 let remaining = (locked_until - std::time::Instant::now()).as_secs();
                 return Ok((
                     StatusCode::TOO_MANY_REQUESTS,
-                    Json(serde_json::json!({"error": format!("请 {remaining} 秒后再试")})),
+                    Json(serde_json::json!({"error": format!("Please try again in {remaining}s")})),
                 )
                     .into_response());
             }
@@ -80,7 +123,7 @@ pub async fn login(State(state): State<Arc<WebState>>, Json(body): Json<LoginReq
     let token = uuid::Uuid::new_v4().to_string();
     state.sessions.write().await.insert(token.clone());
 
-    let cookie = format!("dbx_session={token}; Path=/; HttpOnly; SameSite=Lax");
+    let cookie = session_cookie(&state, &token);
     Ok((StatusCode::OK, [("set-cookie", cookie.as_str())], Json(serde_json::json!({"ok": true}))).into_response())
 }
 
@@ -109,12 +152,17 @@ pub async fn setup(State(state): State<Arc<WebState>>, Json(body): Json<LoginReq
 
     // Update in-memory state
     *state.password_hash.write().await = Some(hash);
+    if state.migration_ready.load(std::sync::atomic::Ordering::Acquire) {
+        if let Err(error) = state.web_mcp.reload(&state.app.storage, true).await {
+            log::error!("Web MCP remained disabled after password setup: {error}");
+        }
+    }
 
     // Auto-login: create session
     let token = uuid::Uuid::new_v4().to_string();
     state.sessions.write().await.insert(token.clone());
 
-    let cookie = format!("dbx_session={token}; Path=/; HttpOnly; SameSite=Lax");
+    let cookie = session_cookie(&state, &token);
     Ok((StatusCode::OK, [("set-cookie", cookie.as_str())], Json(serde_json::json!({"ok": true}))).into_response())
 }
 
@@ -135,8 +183,20 @@ pub async fn check(State(state): State<Arc<WebState>>, req: Request<axum::body::
 
 pub async fn change_password(
     State(state): State<Arc<WebState>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<ChangePasswordRequest>,
 ) -> Result<Response, StatusCode> {
+    // Session-bound: this endpoint used to sit outside the auth middleware,
+    // giving unauthenticated callers an unlimited online guess at the admin
+    // password with none of login's lockout. It now requires a live session
+    // (defense in depth — the middleware gates it too) and, after a successful
+    // change, revokes every OTHER session so a stolen old cookie cannot survive
+    // a credential rotation.
+    let current_token = session_token_from_headers(&headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    if !state.sessions.read().await.contains(&current_token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
     let hash_guard = state.password_hash.read().await;
     let hash_str = match hash_guard.as_deref() {
         Some(h) => h.to_string(),
@@ -162,19 +222,34 @@ pub async fn change_password(
     state.app.storage.save_password_hash(&new_hash).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     *state.password_hash.write().await = Some(new_hash);
 
+    // Rotation revokes sibling sessions; only the caller stays logged in.
+    {
+        let mut sessions = state.sessions.write().await;
+        for token in sessions.iter().filter(|token| **token != current_token) {
+            dbx_core::query::pl_debug::pl_debug_revoke_web_owner_core(&state.app, token);
+        }
+        sessions.retain(|token| *token == current_token);
+    }
+
     Ok((StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response())
 }
 
 pub async fn logout(State(state): State<Arc<WebState>>, req: Request<axum::body::Body>) -> Response {
     if let Some(token) = extract_session_token(&req) {
-        state.sessions.write().await.remove(&token);
+        {
+            let mut sessions = state.sessions.write().await;
+            sessions.remove(&token);
+            dbx_core::query::pl_debug::pl_debug_revoke_web_owner_core(&state.app, &token);
+        }
+        // 登出只清除当前登录会话的临时密码，不影响其他会话与桌面端凭据。
+        state.app.session_credentials.clear_owner(&token);
     }
-    let cookie = "dbx_session=; Path=/; HttpOnly; Max-Age=0";
-    (StatusCode::OK, [("set-cookie", cookie)], Json(serde_json::json!({"ok": true}))).into_response()
+    let cookie = format!("dbx_session=; Path={}; HttpOnly; Max-Age=0", session_cookie_path(&state));
+    (StatusCode::OK, [("set-cookie", cookie.as_str())], Json(serde_json::json!({"ok": true}))).into_response()
 }
 
-fn extract_session_token<B>(req: &Request<B>) -> Option<String> {
-    let cookie_header = req.headers().get("cookie")?.to_str().ok()?;
+pub fn session_token_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+    let cookie_header = headers.get("cookie")?.to_str().ok()?;
     for pair in cookie_header.split(';') {
         let pair = pair.trim();
         if let Some(value) = pair.strip_prefix("dbx_session=") {
@@ -186,33 +261,78 @@ fn extract_session_token<B>(req: &Request<B>) -> Option<String> {
     None
 }
 
+fn extract_session_token<B>(req: &Request<B>) -> Option<String> {
+    session_token_from_headers(req.headers())
+}
+
 pub async fn auth_middleware(
     State(state): State<Arc<WebState>>,
     req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    // No password set — allow everything
+    // Only the bootstrap auth endpoints are reachable without a session —
+    // login/setup/check. change-password and logout require one: change-password
+    // must not be an unauthenticated password oracle.
+    let api_suffix = middleware_api_path_suffix(req.uri().path(), &state.public_base_path);
+    if api_suffix.is_some_and(|suffix| matches!(suffix, "auth/login" | "auth/setup" | "auth/check")) {
+        return next.run(req).await;
+    }
+
+    // Non-API requests (static files) are always accessible.
+    if api_suffix.is_none() {
+        return next.run(req).await;
+    }
+
+    if state.password_disabled {
+        return next.run(req).await;
+    }
+
     if state.password_hash.read().await.is_none() {
-        return next.run(req).await;
-    }
-
-    // Auth endpoints are always accessible
-    let path = req.uri().path();
-    if path.starts_with("/api/auth/") {
-        return next.run(req).await;
-    }
-
-    // Non-API requests (static files) are always accessible
-    if !path.starts_with("/api/") {
-        return next.run(req).await;
+        return StatusCode::UNAUTHORIZED.into_response();
     }
 
     // Check session token
-    if let Some(token) = extract_session_token(&req) {
-        if state.sessions.read().await.contains(&token) {
-            return next.run(req).await;
+    let token = extract_session_token(&req);
+    if let Some(ref token) = token {
+        if state.sessions.read().await.contains(token) {
+            // 在下游处理器及其 await 到的池创建路径上注入当前登录会话的 owner 作用域，
+            // 使 save_password=false 连接的临时密码按会话隔离（见 SessionCredentialStore）。
+            let owner = token.clone();
+            return dbx_core::session_credentials::with_credential_owner(
+                Some(owner),
+                async move { next.run(req).await },
+            )
+            .await;
         }
     }
 
     StatusCode::UNAUTHORIZED.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{api_path_suffix, middleware_api_path_suffix};
+
+    #[test]
+    fn api_path_suffix_handles_root_api_paths() {
+        assert_eq!(api_path_suffix("/api/auth/check", "/"), Some("auth/check"));
+        assert_eq!(api_path_suffix("/api/query/execute", "/"), Some("query/execute"));
+        assert_eq!(api_path_suffix("/dbx/api/auth/check", "/"), None);
+    }
+
+    #[test]
+    fn api_path_suffix_handles_mounted_api_paths() {
+        assert_eq!(api_path_suffix("/dbx/api/auth/check", "/dbx"), Some("auth/check"));
+        assert_eq!(api_path_suffix("/tools/dbx/api/query/execute", "/tools/dbx"), Some("query/execute"));
+        assert_eq!(api_path_suffix("/dbx/login", "/dbx"), None);
+    }
+
+    #[test]
+    pub(crate) fn middleware_api_path_suffix_handles_nested_router_paths() {
+        assert_eq!(middleware_api_path_suffix("/auth/check", "/"), Some("auth/check"));
+        assert_eq!(middleware_api_path_suffix("/connection/list", "/"), Some("connection/list"));
+        assert_eq!(middleware_api_path_suffix("/api/connection/list", "/"), Some("connection/list"));
+        assert_eq!(middleware_api_path_suffix("/dbx/api/connection/list", "/dbx"), Some("connection/list"));
+        assert_eq!(middleware_api_path_suffix("/dbx/login", "/dbx"), None);
+    }
 }

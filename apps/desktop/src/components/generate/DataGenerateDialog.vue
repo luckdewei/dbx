@@ -1,21 +1,26 @@
 <script setup lang="ts">
-import { reactive, ref, computed, onMounted, watch, type ComponentPublicInstance } from "vue";
+import { reactive, ref, computed, watch, type ComponentPublicInstance } from "vue";
 import { useI18n } from "vue-i18n";
 import { useConnectionStore } from "@/stores/connectionStore";
-import * as api from "@/lib/api";
-import type { TableGenerateConfig } from "@/lib/dataGenerate";
-import { findGeneratorKey, generateTableData, defaultGeneratorParams } from "@/lib/dataGenerate";
-import { quoteTableIdentifier } from "@/lib/tableSelectSql";
-import { isTauriRuntime } from "@/lib/tauriRuntime";
-import { effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
+import * as api from "@/lib/backend/api";
+import { BackendErrorException } from "@/lib/backend/errorUtils";
+import type { ColumnGenerateConfig, TableGenerateConfig } from "@/lib/dataGrid/dataGenerate";
+import { defaultGeneratorParams, displayGeneratedValue, findGeneratorKey, formatGeneratedValue, generateTableData, supportsGeneratedMultiRowValues, UniqueValueGenerationError } from "@/lib/dataGrid/dataGenerate";
+import { qualifiedTableName, quoteTableIdentifier } from "@/lib/table/tableSelectSql";
+import { constrainMysqlGenerateColumns, mysqlGeneratePartitionQuery, MysqlGeneratePartitionError, type MysqlGeneratePartition } from "@/lib/dataGrid/mysqlGeneratePartitions";
+import { uniqueConstraintColumns } from "@/lib/table/uniqueConstraintColumns";
+import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
+import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
 import GeneratorParamsPanel from "./params/GeneratorParamsPanel.vue";
 import type { ColumnInfo, TableInfo } from "@/types/database";
+import { cancelDataGenerateSession, getDataGenerateSession, startDataGenerateSession, type DataGenerateTarget } from "@/composables/useDataGenerateSession";
 
 import { Dialog, DialogHeader, DialogTitle, DialogScrollContent, DialogContent, DialogFooter } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Database, Table, Columns, Loader2, Save, Upload, Settings, ChevronRight, X, AlertCircle, ArrowUp, ArrowDown } from "@lucide/vue";
+import { Database, Table, Columns, Loader2, Save, Upload, Settings, ChevronRight, X, AlertCircle, ArrowUp, ArrowDown, Minimize2 } from "@lucide/vue";
 import { ScrollArea } from "@/components/ui/scroll-area";
 
 const { t } = useI18n();
@@ -28,6 +33,7 @@ const props = defineProps<{
   prefillDatabase?: string;
   prefillSchema?: string;
   prefillTable?: string;
+  sessionId?: string | null;
 }>();
 
 // Left tree state
@@ -55,7 +61,24 @@ const panelColumnName = ref<string | null>(null);
 
 // Step state: config -> preview
 const currentStep = ref<"config" | "preview" | "result">("config");
-const generatedResults = ref<{ tableName: string; columns: string[]; rows: unknown[][]; sql: string }[]>([]);
+type GeneratedTableResult = DataGenerateTarget;
+const generatedResults = ref<GeneratedTableResult[]>([]);
+const generationError = ref("");
+
+/**
+ * Preview only materializes a small sample. Generating the full row set up
+ * front froze the UI for hundreds of thousands of rows and exhausted memory
+ * at millions of rows.
+ */
+const PREVIEW_SAMPLE_ROWS = 50;
+const MAX_ROW_COUNT = 100_000_000;
+const DEFAULT_BATCH_ROWS = 1000;
+const LARGE_ROW_COUNT_HINT = 100_000;
+
+function normalizeRowCount(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(MAX_ROW_COUNT, Math.floor(value)));
+}
 
 const connectionName = computed(() => (props.prefillConnectionId ? store.getConfig(props.prefillConnectionId)?.name : ""));
 
@@ -64,6 +87,14 @@ function tableKey(schema: string, table: string) {
 }
 function colKey(schema: string, table: string, column: string) {
   return `${schema}.${table}.${column}`;
+}
+
+function tableInfo(schema: string, table: string): TableInfo | undefined {
+  return schemaTables[schema]?.find((item) => item.name === table);
+}
+
+function isTdengineTagColumn(column: ColumnInfo): boolean {
+  return (column.extra ?? "").toUpperCase().includes("TAG") || (column.comment ?? "").toUpperCase() === "TAG";
 }
 
 // Derived state for template
@@ -104,16 +135,19 @@ async function loadSchemas() {
         try {
           const tables = await api.listTables(cid, db, targetSchema);
           schemaTables[targetSchema] = tables;
-          if (tables.some((t: { name: string }) => t.name === props.prefillTable)) {
+          const prefillTableInfo = tables.find((table) => table.name === props.prefillTable);
+          if (prefillTableInfo) {
             const cols = await api.getColumns(cid, db, targetSchema, props.prefillTable);
+            const uniqueColumns = await singleColumnUniqueConstraints(cid, db, targetSchema, props.prefillTable);
             const key = tableKey(targetSchema, props.prefillTable);
             configs[key] = {
               tableName: props.prefillTable,
+              tableType: prefillTableInfo.table_type,
               schema: targetSchema,
               database: db,
               rowCount: 1000,
               columns: cols.map((c: ColumnInfo) => {
-                const isAI = c.extra === "auto_increment" || (c.column_default?.includes("nextval") ?? false);
+                const isAI = c.extra === "auto_increment" || (c.column_default?.toLowerCase().includes("nextval") ?? false);
                 const gKey = findGeneratorKey(c.name, c.data_type, isAI);
                 return {
                   columnName: c.name,
@@ -129,10 +163,13 @@ async function loadSchemas() {
                       numericPrecision: c.numeric_precision,
                       numericScale: c.numeric_scale,
                       characterMaximumLength: c.character_maximum_length,
+                      uniqueConstraint: uniqueColumns.has(c.name),
                     },
                     gKey,
                   ),
                   isAutoIncrement: isAI,
+                  isTag: isTdengineTagColumn(c),
+                  columnDefault: c.column_default,
                 };
               }),
             };
@@ -140,6 +177,9 @@ async function loadSchemas() {
             for (const c of cols) {
               checkedColumns[colKey(targetSchema, props.prefillTable, c.name)] = true;
             }
+            panelTableKey.value = key;
+            panelMode.value = "table";
+            panelColumnName.value = null;
             break;
           }
         } catch {
@@ -151,6 +191,21 @@ async function loadSchemas() {
     // silently fail
   } finally {
     loading.value = false;
+  }
+}
+
+/**
+ * Columns covered by a single-column unique constraint (PRIMARY KEY or UNIQUE
+ * index). The generator switches per-column uniqueness on for them so an
+ * INSERT batch never repeats a value the server will reject (#5958).
+ */
+async function singleColumnUniqueConstraints(cid: string, db: string, schema: string, table: string): Promise<Set<string>> {
+  try {
+    return uniqueConstraintColumns(await api.listIndexes(cid, db, schema, table));
+  } catch {
+    // Index metadata is a best-effort hint: without it the generator keeps the
+    // previous behaviour instead of failing to open the dialog.
+    return new Set<string>();
   }
 }
 
@@ -199,13 +254,15 @@ async function loadColumns(schema: string, table: string) {
   if (configs[key]) return configs[key];
   if (!props.prefillConnectionId || !props.prefillDatabase) return null;
   const cols = await api.getColumns(props.prefillConnectionId, props.prefillDatabase, schema, table);
+  const uniqueColumns = await singleColumnUniqueConstraints(props.prefillConnectionId, props.prefillDatabase, schema, table);
   const cfg: TableGenerateConfig = {
     tableName: table,
+    tableType: tableInfo(schema, table)?.table_type,
     schema,
     database: props.prefillDatabase,
     rowCount: 1000,
     columns: cols.map((c: ColumnInfo) => {
-      const isAI = c.extra === "auto_increment" || (c.column_default?.includes("nextval") ?? false);
+      const isAI = c.extra === "auto_increment" || (c.column_default?.toLowerCase().includes("nextval") ?? false);
       const gKey = findGeneratorKey(c.name, c.data_type, isAI);
       return {
         columnName: c.name,
@@ -221,10 +278,13 @@ async function loadColumns(schema: string, table: string) {
             numericPrecision: c.numeric_precision,
             numericScale: c.numeric_scale,
             characterMaximumLength: c.character_maximum_length,
+            uniqueConstraint: uniqueColumns.has(c.name),
           },
           gKey,
         ),
         isAutoIncrement: isAI,
+        isTag: isTdengineTagColumn(c),
+        columnDefault: c.column_default,
       };
     }),
   };
@@ -257,6 +317,26 @@ async function selectTable(schema: string, table: string, checked: boolean) {
         checkedColumns[colKey(schema, table, c.name ?? (c as any).columnName)] = false;
       }
     }
+  }
+}
+
+async function activateTable(schema: string, table: string) {
+  const key = tableKey(schema, table);
+  if (!checkedTables[key]) {
+    await selectTable(schema, table, true);
+  }
+  await showTable(schema, table);
+}
+
+async function updateTableSelection(schema: string, table: string, checked: boolean) {
+  const key = tableKey(schema, table);
+  await selectTable(schema, table, checked);
+  if (checked) {
+    await showTable(schema, table);
+  } else if (panelTableKey.value === key) {
+    panelTableKey.value = null;
+    panelMode.value = null;
+    panelColumnName.value = null;
   }
 }
 
@@ -322,7 +402,25 @@ function onPreviewColResizeStart(ci: number, event: MouseEvent) {
   document.addEventListener("pointerup", onUp);
   document.body.classList.add("select-none", "cursor-col-resize");
 }
-const currentPreview = computed(() => generatedResults.value[previewTableIndex.value] ?? { tableName: "", columns: [], rows: [], sql: "" });
+const currentPreview = computed<GeneratedTableResult>(
+  () =>
+    generatedResults.value[previewTableIndex.value] ?? {
+      tableName: "",
+      schema: "",
+      database: "",
+      columns: [],
+      rows: [],
+      sql: "",
+      statements: [],
+      targetRowCount: 0,
+      isSample: false,
+      resolvedColumns: [],
+    },
+);
+
+function displayPreviewCell(cell: unknown): string {
+  return displayGeneratedValue(cell);
+}
 
 async function fetchMaxValues(cfg: TableGenerateConfig): Promise<Record<string, number>> {
   const starts: Record<string, number> = {};
@@ -347,26 +445,59 @@ async function fetchMaxValues(cfg: TableGenerateConfig): Promise<Record<string, 
   return starts;
 }
 
+async function constrainPartitionColumns(cfg: TableGenerateConfig, columns: ColumnGenerateConfig[]): Promise<ColumnGenerateConfig[]> {
+  if (dbType.value !== "mysql") return columns;
+  // Native MySQL listPartitions currently returns no metadata. Use the catalog
+  // directly, and propagate read failures rather than inserting unconstrained rows.
+  const result = await api.executeQuery(props.prefillConnectionId!, props.prefillDatabase!, mysqlGeneratePartitionQuery(cfg.schema || cfg.database, cfg.tableName), cfg.schema, undefined, { maxRows: 8192 });
+  if (result.execution_error || result.error) throw new BackendErrorException(result.error || "Partition metadata query failed.");
+  if (result.truncated || result.has_more) throw new MysqlGeneratePartitionError(cfg.tableName, "incomplete partition metadata");
+  const partitions: MysqlGeneratePartition[] = result.rows.map((row) => ({ method: String(row[0] ?? ""), expression: String(row[1] ?? ""), description: String(row[2] ?? "") }));
+  return constrainMysqlGenerateColumns({ ...cfg, columns, rowCount: normalizeRowCount(cfg.rowCount) }, partitions);
+}
+
+function buildSampleResult(cfg: TableGenerateConfig, columns: ColumnGenerateConfig[], targetRowCount: number): GeneratedTableResult {
+  const sampleCount = Math.min(targetRowCount, PREVIEW_SAMPLE_ROWS);
+  const result = generateTableData({ ...cfg, columns, rowCount: sampleCount }, dbType.value);
+  return {
+    tableName: cfg.tableName,
+    schema: cfg.schema,
+    database: cfg.database,
+    tableType: cfg.tableType,
+    targetRowCount,
+    isSample: targetRowCount > sampleCount,
+    resolvedColumns: columns,
+    ...result,
+  };
+}
+
 async function doGenerate() {
-  const results: { tableName: string; columns: string[]; rows: unknown[][]; sql: string }[] = [];
-  const order = tableOrder.value.length > 0 ? tableOrder.value : Object.keys(configs);
-  for (const key of order) {
-    if (!checkedTables[key]) continue;
-    const cfg = configs[key];
-    let columns = cfg.columns.filter((col) => checkedColumns[colKey(cfg.schema, cfg.tableName, col.columnName)] !== false);
-    if (columns.length === 0) continue;
-    const aiStarts = await fetchMaxValues(cfg);
-    if (Object.keys(aiStarts).length > 0) {
-      columns = columns.map((col) => {
-        const start = aiStarts[col.columnName];
-        if (start !== undefined) {
-          return { ...col, generatorKey: "sequence", generatorParams: { startValue: start, increment: 1 } };
-        }
-        return col;
-      });
+  if (!Object.values(checkedTables).some(Boolean)) return;
+  generationError.value = "";
+  const results: GeneratedTableResult[] = [];
+  try {
+    const order = tableOrder.value.length > 0 ? tableOrder.value : Object.keys(configs);
+    for (const key of order) {
+      if (!checkedTables[key]) continue;
+      const cfg = configs[key];
+      let columns = cfg.columns.filter((col) => checkedColumns[colKey(cfg.schema, cfg.tableName, col.columnName)] !== false);
+      if (columns.length === 0) continue;
+      const aiStarts = await fetchMaxValues(cfg);
+      if (Object.keys(aiStarts).length > 0) {
+        columns = columns.map((col) => {
+          const start = aiStarts[col.columnName];
+          if (start !== undefined) {
+            return { ...col, generatorKey: "sequence", generatorParams: { startValue: start, increment: 1 } };
+          }
+          return col;
+        });
+      }
+      columns = await constrainPartitionColumns(cfg, columns);
+      results.push(buildSampleResult(cfg, columns, normalizeRowCount(cfg.rowCount)));
     }
-    const result = generateTableData({ ...cfg, columns }, dbType.value);
-    results.push({ tableName: cfg.tableName, columns: result.columns, rows: result.rows, sql: result.sql });
+  } catch (error) {
+    generationError.value = generationErrorMessage(error);
+    return;
   }
   generatedResults.value = results;
   previewTableIndex.value = 0;
@@ -375,7 +506,8 @@ async function doGenerate() {
 
 async function regenerate() {
   if (generatedResults.value.length === 0) return;
-  const key = Object.keys(configs).find((k) => configs[k].tableName === generatedResults.value[previewTableIndex.value]?.tableName);
+  const preview = generatedResults.value[previewTableIndex.value];
+  const key = Object.keys(configs).find((k) => configs[k].tableName === preview?.tableName && configs[k].schema === preview?.schema);
   if (!key) return;
   const cfg = configs[key];
   let columns = cfg.columns.filter((col) => checkedColumns[colKey(cfg.schema, cfg.tableName, col.columnName)] !== false);
@@ -389,53 +521,95 @@ async function regenerate() {
       return col;
     });
   }
-  const result = generateTableData({ ...cfg, columns }, dbType.value);
-  generatedResults.value[previewTableIndex.value] = { tableName: cfg.tableName, columns: result.columns, rows: result.rows, sql: result.sql };
+  generationError.value = "";
+  try {
+    columns = await constrainPartitionColumns(cfg, columns);
+    generatedResults.value[previewTableIndex.value] = buildSampleResult(cfg, columns, normalizeRowCount(cfg.rowCount));
+  } catch (error) {
+    generationError.value = generationErrorMessage(error);
+  }
 }
 
-function copyAllSql() {
+function generationErrorMessage(error: unknown): string {
+  if (error instanceof MysqlGeneratePartitionError) {
+    return t("dataGenerate.partitionValuesUnsupported", { table: error.table, expression: error.expression });
+  }
+  if (error instanceof UniqueValueGenerationError) {
+    return t("dataGenerate.uniqueExhausted", { table: error.tableName, column: error.columnName, attempts: error.attempts });
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Copies the script behind the preview. The preview only materializes a
+ * `PREVIEW_SAMPLE_ROWS` sample, so this is the sample script rather than the
+ * full batch — the label says so, and the insert step generates the remaining
+ * rows incrementally instead of holding them in memory.
+ */
+function copySampleSql() {
   const allSql = allSqlStatements().join("\n\n");
   void navigator.clipboard.writeText(allSql);
 }
 
-const executing = ref(false);
-
-interface TableResult {
-  table: string;
-  total: number;
-  ok: number;
-  err: number;
-  error?: string;
-}
-const executeResults = ref<TableResult[]>([]);
+const activeSessionId = ref<string | null>(props.sessionId ?? null);
+const activeSession = computed(() => getDataGenerateSession(activeSessionId.value));
+const executing = computed(() => activeSession.value?.status === "running" || activeSession.value?.status === "cancelling");
+const executeResults = computed(() => activeSession.value?.results ?? []);
 
 const generateOptions = reactive({
   continueOnError: false,
   truncate: false,
   useTransaction: true,
   extendedInsert: true,
+  /** 0 means "no timeout" — the backend maps 0 to an unbounded wait. */
+  timeoutSecs: 0,
+  batchRows: DEFAULT_BATCH_ROWS,
 });
+const supportsExtendedInsert = computed(() => supportsGeneratedMultiRowValues(dbType.value));
+watch(
+  supportsExtendedInsert,
+  (supported) => {
+    if (!supported) generateOptions.extendedInsert = false;
+  },
+  { immediate: true },
+);
 
 const optionsDialogOpen = ref(false);
 
-function sqlStatementsForTable(r: { tableName: string; columns: string[]; rows: unknown[][]; sql: string }): string[] {
+const insertProgress = computed(() => activeSession.value?.progress ?? null);
+
+const insertPercent = computed(() => {
+  const p = insertProgress.value;
+  if (!p || p.totalRows <= 0) return 0;
+  return Math.min(100, Math.round((p.insertedRows / p.totalRows) * 100));
+});
+
+function cancelInsert() {
+  if (!executing.value || !activeSessionId.value) return;
+  void cancelDataGenerateSession(activeSessionId.value);
+}
+
+function normalizeTimeoutSecs(value: number): number {
+  if (!Number.isFinite(value) || value < 0) return 0;
+  return Math.min(86_400, Math.floor(value));
+}
+
+function sqlStatementsForTable(r: GeneratedTableResult): string[] {
   const stmts: string[] = [];
+  const targetTable = qualifiedTableName({ databaseType: dbType.value, schema: r.schema, tableName: r.tableName, database: props.prefillDatabase });
   if (generateOptions.truncate) {
-    stmts.push(`TRUNCATE TABLE ${quoteTableIdentifier(dbType.value, r.tableName)};`);
+    stmts.push(`TRUNCATE TABLE ${targetTable};`);
   }
-  if (generateOptions.extendedInsert) {
-    stmts.push(r.sql);
+  if (generateOptions.extendedInsert || !supportsGeneratedMultiRowValues(dbType.value)) {
+    stmts.push(...r.statements);
   } else {
     const colList = r.columns.map((c) => quoteTableIdentifier(dbType.value, c)).join(", ");
+    // Match by column name: rows may carry a leading tbname (TDengine stable),
+    // so positional indexes into resolvedColumns would drift.
+    const dataTypeByName = new Map(r.resolvedColumns.map((c) => [c.columnName.toLowerCase(), c.dataType]));
     for (const row of r.rows) {
-      const vals = row
-        .map((v) => {
-          if (v === null || v === undefined) return "NULL";
-          if (typeof v === "number") return String(v);
-          return `'${String(v).replace(/'/g, "''")}'`;
-        })
-        .join(", ");
-      stmts.push(`INSERT INTO ${quoteTableIdentifier(dbType.value, r.tableName)} (${colList}) VALUES (${vals});`);
+      const vals = row.map((value, index) => formatGeneratedValue(value, dbType.value, dataTypeByName.get(r.columns[index]?.toLowerCase() ?? ""))).join(", ");
+      stmts.push(`INSERT INTO ${targetTable} (${colList}) VALUES (${vals});`);
     }
   }
   return stmts;
@@ -446,44 +620,58 @@ function allSqlStatements(): string[] {
 }
 
 async function startInsert() {
-  if (executing.value) return;
+  if (executing.value || generationError.value) return;
   const cid = props.prefillConnectionId;
   const db = props.prefillDatabase;
   if (!cid || !db) return;
-  executing.value = true;
-  const perTable: TableResult[] = [];
-  for (const r of generatedResults.value) {
-    const stmts = sqlStatementsForTable(r);
-    const rowCount = r.rows.length;
-    let ok = 0;
-    let lastError = "";
-    for (let si = 0; si < stmts.length; si++) {
-      try {
-        if (generateOptions.useTransaction) {
-          await api.executeInTransaction(cid, db, [stmts[si]], props.prefillSchema);
-        } else {
-          await api.executeQuery(cid, db, stmts[si], props.prefillSchema);
-        }
-        if (generateOptions.extendedInsert) {
-          ok = rowCount;
-        } else if (!(generateOptions.truncate && si === 0)) {
-          ok++;
-        }
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        console.error("[startInsert] SQL error:", msg);
-        if (!lastError) lastError = msg;
-        if (generateOptions.extendedInsert) {
-          ok = 0;
-        }
-        if (!generateOptions.continueOnError) break;
-      }
-    }
-    perTable.push({ table: r.tableName, total: rowCount, ok, err: rowCount - ok, error: lastError || undefined });
+  const targets = generatedResults.value.filter((r) => r.targetRowCount > 0 && r.resolvedColumns.length > 0);
+  if (targets.length === 0) return;
+  const guardSql = allSqlStatements().join("\n") || `INSERT INTO ${targets[0].tableName}`;
+  try {
+    await executeWithProductionSqlGuard({
+      connection: store.getConfig(cid),
+      database: db,
+      sql: guardSql,
+      source: t("production.sourceDataGenerate"),
+      execute: async () => {
+        const session = startDataGenerateSession(
+          {
+            connectionId: cid,
+            database: db,
+            prefillSchema: props.prefillSchema,
+            databaseType: dbType.value,
+            label: targets.length === 1 ? `${db}.${targets[0].tableName}` : `${db} (${targets.length})`,
+            targets,
+            options: {
+              continueOnError: generateOptions.continueOnError,
+              truncate: generateOptions.truncate,
+              useTransaction: generateOptions.useTransaction,
+              extendedInsert: generateOptions.extendedInsert,
+              timeoutSecs: normalizeTimeoutSecs(generateOptions.timeoutSecs),
+              batchRows: Math.max(1, Math.floor(generateOptions.batchRows) || DEFAULT_BATCH_ROWS),
+            },
+          },
+          {
+            invalidateMetadataCache: (connectionId, database, schema, table) => store.invalidateMetadataCache(connectionId, database, schema, table),
+            formatGenerationError: generationErrorMessage,
+          },
+        );
+        activeSessionId.value = session.id;
+        applyDataGenerateSession(session);
+        return true;
+      },
+    });
+  } catch (error) {
+    generationError.value = generationErrorMessage(error);
   }
-  executeResults.value = perTable;
-  currentStep.value = "result";
-  executing.value = false;
+}
+
+function applyDataGenerateSession(session = activeSession.value) {
+  if (!session) return;
+  generatedResults.value = session.config.targets;
+  generationError.value = session.error ?? "";
+  previewTableIndex.value = Math.min(previewTableIndex.value, Math.max(0, generatedResults.value.length - 1));
+  currentStep.value = session.status === "running" || session.status === "cancelling" ? "preview" : "result";
 }
 
 const orderDialogOpen = ref(false);
@@ -492,6 +680,7 @@ const tableOrder = ref<string[]>([]);
 const orderableTables = computed(() => {
   return Object.keys(checkedTables).filter((k) => checkedTables[k]);
 });
+const hasSelectedTables = computed(() => orderableTables.value.length > 0);
 
 function openOrderDialog() {
   tableOrder.value = [...orderableTables.value];
@@ -545,15 +734,29 @@ watch(
   { deep: true, flush: "post" },
 );
 
-onMounted(() => {
-  void loadSchemas();
-});
-
-watch(open, (val) => {
-  if (val) {
+watch(
+  [() => open.value, () => props.sessionId],
+  ([isOpen, sessionId]) => {
+    if (!isOpen) return;
+    const session = getDataGenerateSession(sessionId);
+    if (session) {
+      activeSessionId.value = session.id;
+      applyDataGenerateSession(session);
+      return;
+    }
+    activeSessionId.value = null;
     void loadSchemas();
-  }
-});
+  },
+  { immediate: true },
+);
+
+watch(
+  () => {
+    const session = getDataGenerateSession(activeSessionId.value);
+    return session ? `${session.id}:${session.version}` : "";
+  },
+  () => applyDataGenerateSession(),
+);
 
 interface GenerateProfileJson {
   version: 1;
@@ -719,6 +922,8 @@ async function onFileSelected(event: Event) {
         <span class="ml-1 font-medium">{{ connectionName || props.prefillDatabase }}</span>
       </div>
 
+      <div v-if="generationError" class="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive" role="alert">{{ generationError }}</div>
+
       <template v-if="currentStep === 'config'">
         <div class="flex gap-4 min-h-[400px]">
           <!-- left: schema tree -->
@@ -745,14 +950,14 @@ async function onFileSelected(event: Event) {
                 <div v-if="expandedSchemas[sc] && schemaTables[sc]" class="ml-[18px]">
                   <div v-for="tbl in schemaTables[sc]" :key="tbl.name">
                     <!-- table row -->
-                    <div class="group flex items-center gap-1.5 py-1 px-2 cursor-pointer hover:bg-accent">
-                      <button type="button" class="-m-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted hover:text-foreground" @click="toggleTable(sc, tbl.name)">
+                    <div class="group flex items-center gap-1.5 py-1 px-2 cursor-pointer hover:bg-accent" @click="activateTable(sc, tbl.name)">
+                      <button type="button" class="-m-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted hover:text-foreground" @click.stop="toggleTable(sc, tbl.name)">
                         <Loader2 v-if="tableColumnsLoading[tableKey(sc, tbl.name)]" class="h-3.5 w-3.5 animate-spin" />
                         <ChevronRight v-else class="h-3.5 w-3.5 transition-transform" :class="{ 'rotate-90': expandedTables[tableKey(sc, tbl.name)] }" />
                       </button>
-                      <input type="checkbox" class="h-3.5 w-3.5 accent-primary shrink-0" :checked="!!checkedTables[tableKey(sc, tbl.name)]" :ref="(el) => setTableRef(el, tableKey(sc, tbl.name))" @change="selectTable(sc, tbl.name, ($event.target as HTMLInputElement).checked)" />
+                      <input type="checkbox" class="h-3.5 w-3.5 accent-primary shrink-0" :checked="!!checkedTables[tableKey(sc, tbl.name)]" :ref="(el) => setTableRef(el, tableKey(sc, tbl.name))" @click.stop @change="updateTableSelection(sc, tbl.name, ($event.target as HTMLInputElement).checked)" />
                       <Table class="h-3.5 w-3.5 shrink-0 text-green-500" />
-                      <span class="text-sm truncate" :class="{ 'text-foreground font-medium': panelTableKey === tableKey(sc, tbl.name), 'text-muted-foreground': panelTableKey !== tableKey(sc, tbl.name) }" @click="showTable(sc, tbl.name)">
+                      <span class="text-sm truncate" :class="{ 'text-foreground font-medium': panelTableKey === tableKey(sc, tbl.name), 'text-muted-foreground': panelTableKey !== tableKey(sc, tbl.name) }">
                         {{ tbl.name }}
                       </span>
                     </div>
@@ -810,8 +1015,11 @@ async function onFileSelected(event: Event) {
                   </div>
                   <div class="flex items-center gap-3 rounded-md bg-muted/20 px-3 py-2">
                     <Label class="text-xs shrink-0">{{ t("dataGenerate.rowCount") }}:</Label>
-                    <Input v-model.number="activeCfg.rowCount" class="h-7 w-24 text-xs" />
+                    <Input v-model.number="activeCfg.rowCount" type="number" min="0" :max="MAX_ROW_COUNT" class="h-7 w-28 text-xs" @blur="activeCfg.rowCount = normalizeRowCount(activeCfg.rowCount)" />
                   </div>
+                  <p v-if="activeCfg.rowCount > LARGE_ROW_COUNT_HINT" class="px-1 text-[11px] leading-relaxed text-muted-foreground">
+                    {{ t("dataGenerate.largeRowCountHint", { count: activeCfg.rowCount.toLocaleString() }) }}
+                  </p>
                 </div>
               </template>
             </div>
@@ -837,14 +1045,29 @@ async function onFileSelected(event: Event) {
           <template v-else>
             <div class="flex items-center justify-between px-3 py-2 border-b bg-muted/10">
               <div class="flex items-center gap-2">
-                <span class="text-xs text-muted-foreground">{{ t("dataGenerate.target") }}：</span>
+                <span class="text-xs text-muted-foreground">{{ t("dataGenerate.target") }}:</span>
                 <select v-if="generatedResults.length > 1" v-model="previewTableIndex" class="h-7 rounded border bg-background px-2 text-xs">
                   <option v-for="(r, i) in generatedResults" :key="i" :value="i">{{ r.tableName }}</option>
                 </select>
                 <span v-else class="text-sm font-medium">{{ generatedResults[0].tableName }}</span>
-                <span class="text-xs text-muted-foreground">{{ currentPreview.rows.length }} 行</span>
+                <span class="text-xs text-muted-foreground">{{ t("dataGenerate.previewRowCount", { count: currentPreview.targetRowCount }) }}</span>
               </div>
-              <Button variant="outline" size="sm" class="h-7 text-xs" @click="regenerate">{{ t("dataGenerate.regenerate") }}</Button>
+              <Button variant="outline" size="sm" class="h-7 text-xs" :disabled="executing" @click="regenerate">{{ t("dataGenerate.regenerate") }}</Button>
+            </div>
+            <div v-if="executing && insertProgress" class="space-y-1.5 border-b bg-muted/10 px-3 py-2">
+              <div class="flex items-center justify-between gap-2 text-xs">
+                <span class="truncate text-muted-foreground">
+                  {{ t("dataGenerate.insertingTable", { table: insertProgress.tableName, index: insertProgress.tableIndex, count: insertProgress.tableCount }) }}
+                </span>
+                <span class="shrink-0 font-medium tabular-nums">{{ insertProgress.insertedRows.toLocaleString() }} / {{ insertProgress.totalRows.toLocaleString() }}</span>
+              </div>
+              <div class="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                <div class="h-full bg-primary transition-[width] duration-150" :style="{ width: insertPercent + '%' }" />
+              </div>
+              <div class="flex items-center justify-between text-[11px] text-muted-foreground">
+                <span>{{ insertPercent }}%</span>
+                <span>{{ t("dataGenerate.elapsed", { seconds: Math.round(insertProgress.elapsedMs / 1000) }) }}</span>
+              </div>
             </div>
             <div class="flex flex-col h-[380px]">
               <div class="flex-1 overflow-auto overscroll-none bg-background">
@@ -868,12 +1091,14 @@ async function onFileSelected(event: Event) {
                         :style="{ maxWidth: (previewColWidths[ci] ?? 120) + 'px' }"
                         :class="{ 'text-muted-foreground italic': cell === null || cell === undefined }"
                       >
-                        {{ cell === null || cell === undefined ? "NULL" : String(cell) }}
+                        {{ displayPreviewCell(cell) }}
                       </td>
                     </tr>
                   </tbody>
                 </table>
-                <div v-if="currentPreview.rows.length > 50" class="sticky left-0 text-xs text-muted-foreground px-3 py-1.5 border-t border-border bg-background">{{ t("dataGenerate.first50Rows", { count: currentPreview.rows.length }) }}</div>
+                <div v-if="currentPreview.isSample" class="sticky left-0 text-xs text-muted-foreground px-3 py-1.5 border-t border-border bg-background">
+                  {{ t("dataGenerate.samplePreviewNotice", { shown: currentPreview.rows.length, count: currentPreview.targetRowCount }) }}
+                </div>
               </div>
             </div>
           </template>
@@ -894,6 +1119,7 @@ async function onFileSelected(event: Event) {
                 </span>
               </div>
               <div v-if="r.error" class="mt-1 text-destructive/80 break-all leading-relaxed">{{ r.error }}</div>
+              <div v-else-if="r.cancelled" class="mt-1 text-muted-foreground">{{ t("dataGenerate.cancelledLabel") }}</div>
             </div>
           </div>
           <div v-if="executeResults.length === 0" class="flex h-24 items-center justify-center text-xs text-muted-foreground">{{ t("dataGenerate.noResult") }}</div>
@@ -921,22 +1147,24 @@ async function onFileSelected(event: Event) {
             </Button>
           </template>
           <template v-else-if="currentStep === 'preview' && generatedResults.length > 0">
-            <Button variant="outline" size="sm" class="h-7 text-xs" @click="copyAllSql">{{ t("dataGenerate.copyAllSql") }}</Button>
+            <Button variant="outline" size="sm" class="h-7 text-xs" @click="copySampleSql">{{ t("dataGenerate.copySampleSql") }}</Button>
           </template>
         </div>
         <div class="flex items-center gap-2">
           <Button variant="outline" size="sm" class="h-7 text-xs" @click="open = false">
-            <X class="mr-1 h-3 w-3" />
-            {{ t("dangerDialog.cancel") }}
+            <Minimize2 v-if="executing" class="mr-1 h-3 w-3" />
+            <X v-else class="mr-1 h-3 w-3" />
+            {{ executing ? t("exportProgress.minimize") : t("dangerDialog.cancel") }}
           </Button>
           <template v-if="currentStep === 'config'">
-            <Button variant="default" size="sm" class="h-7 text-xs" @click="doGenerate">
+            <Button variant="default" size="sm" class="h-7 text-xs" :disabled="!hasSelectedTables" @click="doGenerate">
               {{ t("dataGenerate.nextStep") }}
             </Button>
           </template>
           <template v-else-if="currentStep === 'preview'">
-            <Button variant="outline" size="sm" class="h-7 text-xs" @click="currentStep = 'config'">{{ t("dataGenerate.prevStep") }}</Button>
-            <Button variant="default" size="sm" class="h-7 text-xs" :disabled="executing" @click="startInsert">
+            <Button variant="outline" size="sm" class="h-7 text-xs" :disabled="!executing" @click="cancelInsert">{{ t("dataGenerate.cancelInsert") }}</Button>
+            <Button variant="outline" size="sm" class="h-7 text-xs" :disabled="executing" @click="currentStep = 'config'">{{ t("dataGenerate.prevStep") }}</Button>
+            <Button variant="default" size="sm" class="h-7 text-xs" :disabled="executing || !!generationError" @click="startInsert">
               <Loader2 v-if="executing" class="mr-1 h-3 w-3 animate-spin" />
               {{ t("dataGenerate.startInsert") }}
             </Button>
@@ -953,7 +1181,7 @@ async function onFileSelected(event: Event) {
     <Dialog v-model:open="optionsDialogOpen">
       <DialogContent class="max-w-sm">
         <DialogHeader>
-          <DialogTitle class="text-sm">生成选项</DialogTitle>
+          <DialogTitle class="text-sm">{{ t("dataGenerate.generateOptions") }}</DialogTitle>
         </DialogHeader>
         <div class="space-y-3 py-2">
           <label class="flex items-center gap-3 cursor-pointer">
@@ -968,10 +1196,20 @@ async function onFileSelected(event: Event) {
             <input type="checkbox" v-model="generateOptions.useTransaction" class="h-4 w-4 accent-primary" />
             <span class="text-xs">{{ t("dataGenerate.useTransaction") }}</span>
           </label>
-          <label class="flex items-center gap-3 cursor-pointer">
-            <input type="checkbox" v-model="generateOptions.extendedInsert" class="h-4 w-4 accent-primary" />
+          <label class="flex items-center gap-3 cursor-pointer" :class="{ 'cursor-not-allowed opacity-50': !supportsExtendedInsert }">
+            <input type="checkbox" v-model="generateOptions.extendedInsert" class="h-4 w-4 accent-primary" :disabled="!supportsExtendedInsert" />
             <span class="text-xs">{{ t("dataGenerate.extendedInsert") }}</span>
           </label>
+          <div class="flex items-center gap-3">
+            <Label class="text-xs shrink-0">{{ t("dataGenerate.timeoutSecs") }}:</Label>
+            <Input v-model.number="generateOptions.timeoutSecs" type="number" min="0" max="86400" class="h-7 w-24 text-xs" @blur="generateOptions.timeoutSecs = normalizeTimeoutSecs(generateOptions.timeoutSecs)" />
+          </div>
+          <p class="text-[11px] leading-relaxed text-muted-foreground">{{ t("dataGenerate.timeoutHint") }}</p>
+          <div class="flex items-center gap-3">
+            <Label class="text-xs shrink-0">{{ t("dataGenerate.batchRows") }}:</Label>
+            <Input v-model.number="generateOptions.batchRows" type="number" min="1" max="100000" class="h-7 w-24 text-xs" />
+          </div>
+          <p class="text-[11px] leading-relaxed text-muted-foreground">{{ t("dataGenerate.batchRowsHint") }}</p>
         </div>
         <DialogFooter>
           <Button size="sm" class="h-7 text-xs" @click="optionsDialogOpen = false">{{ t("dataGenerate.ok") }}</Button>

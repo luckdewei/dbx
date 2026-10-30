@@ -7,12 +7,27 @@ import java.util.Objects;
 public final class QueryPageResult {
     private List<String> columns;
     private List<String> column_types;
+    private List<SpatialColumn> spatial_columns;
+    private List<List<Integer>> spatial_values;
     private List<List<Object>> rows;
     private long affected_rows;
     private long execution_time_ms;
+    private Long server_execute_time_us;
+    private java.util.Map<String, Double> query_timings_ms;
+    /** Number of rows read by this JDBC cursor across all pages; never sent over JSON RPC. */
+    private transient long cursor_rows_read;
     private boolean truncated;
     private String session_id;
     private boolean has_more;
+    private List<java.util.Map<String, Object>> messages;
+
+    public List<java.util.Map<String, Object>> getMessages() {
+        return messages == null ? Collections.emptyList() : messages;
+    }
+
+    public void setMessages(List<java.util.Map<String, Object>> messages) {
+        this.messages = messages;
+    }
 
     public QueryPageResult() {
         this(Collections.emptyList(), Collections.emptyList(), 0L, 0L, false, null, false);
@@ -56,7 +71,10 @@ public final class QueryPageResult {
     ) {
         this.columns = columns == null ? Collections.emptyList() : columns;
         this.column_types = column_types == null ? Collections.emptyList() : column_types;
-        this.rows = QueryResult.normalizeRows(rows);
+        QueryResult.NormalizedRows normalized = QueryResult.normalizeRowsWithSpatial(rows);
+        this.rows = normalized.rows;
+        this.spatial_columns = normalized.spatialColumns.isEmpty() ? null : normalized.spatialColumns;
+        this.spatial_values = normalized.spatialValues.isEmpty() ? null : normalized.spatialValues;
         this.affected_rows = affected_rows;
         this.execution_time_ms = execution_time_ms;
         this.truncated = truncated;
@@ -76,12 +94,32 @@ public final class QueryPageResult {
         return rows;
     }
 
+    public List<SpatialColumn> getSpatial_columns() {
+        return spatial_columns == null ? Collections.emptyList() : spatial_columns;
+    }
+
+    public List<List<Integer>> getSpatial_values() {
+        return spatial_values == null ? Collections.emptyList() : spatial_values;
+    }
+
     public long getAffected_rows() {
         return affected_rows;
     }
 
     public long getExecution_time_ms() {
         return execution_time_ms;
+    }
+
+    public java.util.Map<String, Double> getQuery_timings_ms() { return query_timings_ms; }
+
+    public void setQuery_timings_ms(java.util.Map<String, Double> value) { query_timings_ms = value; }
+
+    public Long getServer_execute_time_us() {
+        return server_execute_time_us;
+    }
+
+    public long getCursor_rows_read() {
+        return cursor_rows_read;
     }
 
     public boolean getTruncated() {
@@ -105,7 +143,18 @@ public final class QueryPageResult {
     }
 
     public void setRows(List<List<Object>> rows) {
-        this.rows = rows;
+        QueryResult.NormalizedRows normalized = QueryResult.normalizeRowsWithSpatial(rows);
+        this.rows = normalized.rows;
+        this.spatial_columns = normalized.spatialColumns.isEmpty() ? null : normalized.spatialColumns;
+        this.spatial_values = normalized.spatialValues.isEmpty() ? null : normalized.spatialValues;
+    }
+
+    public void setSpatial_columns(List<SpatialColumn> spatial_columns) {
+        this.spatial_columns = spatial_columns == null || spatial_columns.isEmpty() ? null : spatial_columns;
+    }
+
+    public void setSpatial_values(List<List<Integer>> spatial_values) {
+        this.spatial_values = spatial_values == null || spatial_values.isEmpty() ? null : spatial_values;
     }
 
     public void setAffected_rows(long affected_rows) {
@@ -114,6 +163,14 @@ public final class QueryPageResult {
 
     public void setExecution_time_ms(long execution_time_ms) {
         this.execution_time_ms = execution_time_ms;
+    }
+
+    public void setServer_execute_time_us(Long server_execute_time_us) {
+        this.server_execute_time_us = server_execute_time_us;
+    }
+
+    public void setCursor_rows_read(long cursor_rows_read) {
+        this.cursor_rows_read = cursor_rows_read;
     }
 
     public void setTruncated(boolean truncated) {
@@ -135,26 +192,32 @@ public final class QueryPageResult {
         QueryPageResult that = (QueryPageResult) other;
         return affected_rows == that.affected_rows
             && execution_time_ms == that.execution_time_ms
+            && Objects.equals(server_execute_time_us, that.server_execute_time_us)
             && truncated == that.truncated
             && has_more == that.has_more
             && Objects.equals(columns, that.columns)
             && Objects.equals(column_types, that.column_types)
+            && Objects.equals(spatial_columns, that.spatial_columns)
+            && Objects.equals(spatial_values, that.spatial_values)
             && Objects.equals(rows, that.rows)
             && Objects.equals(session_id, that.session_id);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(columns, column_types, rows, affected_rows, execution_time_ms, truncated, session_id, has_more);
+        return Objects.hash(columns, column_types, spatial_columns, spatial_values, rows, affected_rows, execution_time_ms, server_execute_time_us, truncated, session_id, has_more);
     }
 
     @Override
     public String toString() {
         return "QueryPageResult(columns=" + columns
             + ", column_types=" + column_types
+            + ", spatial_columns=" + spatial_columns
+            + ", spatial_values=" + spatial_values
             + ", rows=" + rows
             + ", affected_rows=" + affected_rows
             + ", execution_time_ms=" + execution_time_ms
+            + ", server_execute_time_us=" + server_execute_time_us
             + ", truncated=" + truncated
             + ", session_id=" + session_id
             + ", has_more=" + has_more

@@ -1,12 +1,15 @@
 import Link from "next/link";
+import type { DocsLang } from "@/lib/i18n";
 
 const i18n = {
   en: {
-    tagline: "15 MB to manage 50+ databases.",
+    tagline: "25 MB to manage 100+ databases.",
+    privacy: "Privacy",
     copyright: `© ${new Date().getFullYear()} DBX. All rights reserved.`,
   },
   cn: {
-    tagline: "15MB，管理50+种数据库。",
+    tagline: "25MB，管理100+种数据库。",
+    privacy: "隐私政策",
     copyright: `© ${new Date().getFullYear()} DBX.`,
   },
 };
@@ -19,31 +22,37 @@ function GithubIcon() {
   );
 }
 
-export function LandingFooter({ lang }: { lang: "en" | "cn" }) {
+export function LandingFooter({ lang }: { lang: DocsLang }) {
   const t = i18n[lang];
 
   return (
-    <footer className="border-t border-[var(--color-landing-line)] bg-[#0b1120]">
+    <footer className="border-t border-[var(--color-landing-line)] bg-landing-bg">
       <div className="max-w-[1180px] mx-auto px-7 py-7 max-[760px]:px-[18px]">
         <div className="flex items-center justify-between gap-4 max-[760px]:flex-col max-[760px]:gap-3 max-[760px]:text-center">
           {/* Logo */}
-          <Link href={`/${lang}`} className="flex items-center gap-2.5 text-[var(--color-landing-ink)] text-lg font-[820] shrink-0">
-            <img src="/logo.png" alt="DBX" width={22} height={22} />
+          <Link href={`/${lang}`} prefetch={false} className="flex min-h-11 items-center gap-2.5 text-[var(--color-landing-ink)] text-lg font-[820] shrink-0">
+            <img src="/logo-64.png" alt="" aria-hidden="true" width={22} height={22} />
             <span>DBX</span>
           </Link>
 
           {/* Tagline */}
-          <span className="text-[13px] text-[var(--color-landing-muted)]">{t.tagline}</span>
+          <div className="flex items-center gap-3 text-[13px] text-[var(--color-landing-muted)] max-[760px]:flex-col max-[760px]:gap-1">
+            <span>{t.tagline}</span>
+            <span aria-hidden="true" className="max-[760px]:hidden">·</span>
+            <Link href={`/${lang}/privacy`} prefetch={false} className="min-h-8 inline-flex items-center underline decoration-[color-mix(in_srgb,var(--color-landing-muted)_45%,transparent)] underline-offset-4 transition-colors hover:text-[var(--color-landing-ink)]">
+              {t.privacy}
+            </Link>
+          </div>
 
           {/* Repo icons */}
           <div className="flex items-center gap-3 shrink-0">
-            <a href="https://github.com/t8y2/dbx" target="_blank" rel="noopener noreferrer" className="text-[var(--color-landing-muted)] hover:text-[var(--color-landing-ink)] transition-colors" aria-label="GitHub">
+            <a href="https://github.com/t8y2/dbx" target="_blank" rel="noopener noreferrer" className="inline-flex size-11 items-center justify-center text-[var(--color-landing-muted)] hover:text-[var(--color-landing-ink)] transition-colors" aria-label="GitHub">
               <GithubIcon />
             </a>
-            <a href="https://cnb.cool/dbxio.com/dbx" target="_blank" rel="noopener noreferrer" className="opacity-40 hover:opacity-100 transition-opacity" aria-label="CNB">
+            <a href="https://cnb.cool/dbxio.com/dbx" target="_blank" rel="noopener noreferrer" className="inline-flex size-11 items-center justify-center opacity-40 hover:opacity-100 transition-opacity" aria-label="CNB">
               <img src="/icons/cnb.svg" alt="CNB" width={18} height={18} />
             </a>
-            <a href="https://atomgit.com/t8y2/dbx" target="_blank" rel="noopener noreferrer" className="opacity-40 hover:opacity-100 transition-opacity" aria-label="AtomGit">
+            <a href="https://atomgit.com/t8y2/dbx" target="_blank" rel="noopener noreferrer" className="inline-flex size-11 items-center justify-center opacity-40 hover:opacity-100 transition-opacity" aria-label="AtomGit">
               <img src="/icons/atomgit.png" alt="AtomGit" width={18} height={18} />
             </a>
           </div>

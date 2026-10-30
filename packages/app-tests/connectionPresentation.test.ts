@@ -1,7 +1,7 @@
 import { test } from "vitest";
 import assert from "node:assert/strict";
 import type { ConnectionConfig } from "../../apps/desktop/src/types/database.ts";
-import { connectionDriverLabel, connectionEndpointLabel, connectionIconType, connectionOptionSubtitle, connectionRedactedEndpointLabel, connectionRedactedNameLabel, connectionRedactedOptionSubtitle } from "../../apps/desktop/src/lib/connectionPresentation.ts";
+import { connectionDisplayUrlScheme, connectionDriverLabel, connectionEndpointLabel, connectionIconType, connectionOptionSubtitle, connectionRedactedEndpointLabel, connectionRedactedNameLabel, connectionRedactedOptionSubtitle } from "../../apps/desktop/src/lib/connection/connectionPresentation.ts";
 
 const baseConnection: ConnectionConfig = {
   id: "conn-1",
@@ -18,6 +18,34 @@ const baseConnection: ConnectionConfig = {
 
 test("uses driver profile for connection option icon identity", () => {
   assert.equal(connectionIconType(baseConnection), "tidb");
+});
+
+test("presents a JDBC-backed Phoenix connection with its product identity", () => {
+  const connection = {
+    ...baseConnection,
+    db_type: "jdbc" as const,
+    driver_profile: "phoenix",
+    driver_label: "Apache Phoenix",
+    host: "",
+    port: 0,
+    database: undefined,
+  };
+
+  assert.equal(connectionIconType(connection), "phoenix");
+  assert.equal(connectionDriverLabel(connection), "Apache Phoenix");
+  assert.equal(connectionOptionSubtitle(connection), "Apache Phoenix");
+});
+
+test("displays the configured GaussDB protocol in connection URLs", () => {
+  assert.equal(connectionDisplayUrlScheme({ db_type: "gaussdb", driver_profile: "gaussdb" }), "postgresql");
+  assert.equal(connectionDisplayUrlScheme({ db_type: "gaussdb", driver_profile: "gaussdb-m" }), "jdbc:gaussdb");
+});
+
+test("normalizes legacy single-host GaussDB endpoint labels", () => {
+  const connection = { ...baseConnection, db_type: "gaussdb" as const, host: "db.example.com:5433", port: 5432 };
+
+  assert.equal(connectionEndpointLabel(connection), "db.example.com:5433");
+  assert.equal(connectionRedactedEndpointLabel(connection), "db.***.com:****");
 });
 
 test("builds a compact subtitle for duplicate connection names", () => {
@@ -75,6 +103,21 @@ test("redacts network endpoint labels for quick connection cards", () => {
     }),
     "[2001:***:***:***:***:7334]:****",
   );
+});
+
+test("presents Cloudflare D1 account and database identifiers without treating them as a host and port", () => {
+  const d1Connection: ConnectionConfig = {
+    ...baseConnection,
+    db_type: "cloudflare-d1",
+    driver_profile: undefined,
+    driver_label: "Cloudflare D1",
+    host: "account-id",
+    port: 443,
+    database: "database-id",
+  };
+
+  assert.equal(connectionEndpointLabel(d1Connection), "account-id/database-id");
+  assert.equal(connectionRedactedEndpointLabel(d1Connection), "***/***");
 });
 
 test("redacts host-like quick connection names", () => {

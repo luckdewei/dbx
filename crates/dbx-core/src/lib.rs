@@ -1,123 +1,139 @@
-pub mod agent_catalog;
-pub mod agent_connection;
-pub mod agent_events;
-pub mod agent_kv;
-pub mod agent_loop;
-pub mod agent_manager;
-pub mod agent_runtime;
-pub mod agent_service;
-pub mod agent_tools;
+#![recursion_limit = "256"]
+
+pub mod admin;
 pub mod ai;
-pub mod ai_cli_agent;
-pub mod ai_codex_cli;
-pub mod cloud_sync;
+pub mod cc_switch;
+pub mod data;
+pub mod host;
+pub mod persistence;
+pub mod safety;
+
+pub use dbx_ai_provider::{
+    agent_events, ai_claude_code_cli, ai_cli_agent, ai_codebuddy_cli, ai_codex_cli, ai_cursor_cli, ai_effort,
+    ai_grok_cli, ai_opencode_cli, ai_pi_agent_cli, ai_qoder_cli, token_usage,
+};
+pub use dbx_platform::{path_utils, process};
+
+pub use ai::agent_explain;
+pub use ai::agent_kv;
+pub use ai::agent_loop;
+pub use ai::agent_tools;
+pub use ai::plugin_tools;
+pub use ai::skill_tools;
+pub use ai::tool_approval;
+pub use dbx_drivers::agent_catalog;
+pub use dbx_drivers::agent_connection;
+pub use dbx_drivers::agent_manager;
+pub use dbx_drivers::agent_offline_export;
+pub use dbx_drivers::agent_recovery;
+pub use dbx_drivers::agent_runtime;
+pub use dbx_drivers::agent_service;
+pub use dbx_drivers::backend_error;
+pub use dbx_drivers::oracle_oci;
+pub use host::changelog;
+pub use persistence::cloud_sync;
+pub use persistence::config;
 pub mod connection;
-pub mod connection_secrets;
-pub mod csv_export;
-pub mod data_compare;
-pub mod data_grid_sql;
-pub mod database_capabilities;
-pub mod database_export;
-pub mod database_search_sql;
+pub use admin::consul;
+pub use connection::connection_secrets;
+pub use data::correction;
+pub use data::csv_export;
+pub use data::dameng_dump;
+pub use data::data_compare;
+pub use data::database_export;
+pub use dbx_drivers::database_capabilities;
+pub use dbx_sql::data_grid_extractors;
+pub use dbx_sql::data_grid_sql;
+pub use dbx_sql::database_search_columns_sql;
+pub use dbx_sql::database_search_probe_sql;
+pub use dbx_sql::database_search_sql;
+pub use dbx_sql::database_structure_search_sql;
+pub use dbx_types::database_manifest;
 pub mod db;
-pub mod db_admin_sql;
-pub mod driver_runtime;
-pub mod external;
-pub mod history;
-pub mod jdbc;
-pub mod models;
-pub mod mongo_ops;
 #[cfg(feature = "mq-admin")]
-pub mod mq;
-pub mod nacos;
-pub mod object_source_sql;
-pub mod path_utils;
-pub mod plugins;
+pub use admin::mq;
+#[cfg(feature = "mq-admin")]
+pub use admin::mqtt;
+pub use admin::nacos;
+pub use ai::mcp_access;
+pub use ai::mcp_catalog;
+pub use ai::mcp_policy;
+pub use ai::plugin_mcp;
+pub use ai::prompt_template;
+pub use connection::driver_runtime;
+pub use connection::jdbc;
+pub use data::docs;
+pub use data::export_runtime;
+pub use data::mongodb_dump;
+pub use data::mongodb_import_export;
+pub use data::navicat_nb3;
+pub use dbx_drivers::mongo_oidc;
+pub use dbx_drivers::mongo_shell;
+pub use dbx_drivers::salesforce_oauth;
+pub use dbx_formats::export_split_zip;
+pub use dbx_plugin_runtime::plugins;
+pub use dbx_sql::db_admin_sql;
+pub use dbx_sql::dml_binding;
+pub use dbx_sql::dml_preview_sql;
+pub(crate) use dbx_sql::mysql_ddl_normalize;
+pub use dbx_sql::mysql_event_sql;
+pub use dbx_sql::object_source_sql;
+pub use dbx_sql::oracle_view_rename;
+pub use dbx_types::models;
+pub use dbx_types::native_jobs;
+pub use host::external;
+pub use persistence::history;
+pub use query::document_ops;
+pub use query::hbase_ops;
+pub use query::mongo_ops;
+pub use query::object_cache;
+pub use safety::production_safety;
 pub mod query;
-pub mod query_cancel;
-pub mod query_execution_sql;
-pub mod query_result_export;
-pub mod query_result_sql;
-pub mod redis_ops;
-pub mod saved_sql;
+pub use connection::runtime_config;
+pub use data::query_result_export;
+pub use dbx_sql::query_execution_sql;
+pub use dbx_sql::query_result_sql;
+pub use persistence::saved_sql;
+pub use query::query_cancel;
+pub use query::redis_ops;
+pub use safety::risk_metrics;
+pub mod scheduled_backup;
 pub mod schema;
-pub mod schema_diff;
-pub mod sql;
-pub mod sql_analysis;
-pub mod sql_dialect;
-pub mod sql_editability;
-pub mod sql_file_import;
-pub mod sql_risk;
-pub mod sqlite_backup;
-pub mod storage;
-pub mod table_export;
-pub mod table_import;
-pub mod table_structure_sql;
-pub mod text_export;
-pub mod token_usage;
-pub mod transfer;
-pub mod types;
-pub mod update;
-pub mod xlsx_export;
+pub mod skills;
+pub use connection::session_credentials;
+pub use connection::task_supervisor;
+pub use data::script_generator;
+pub use data::sql_file_import;
+pub use data::sqlite_backup;
+pub use data::table_export;
+pub use data::table_import;
+pub use data::transfer;
+pub use data::transfer_rebuild;
+pub use data::transfer_runner;
+pub use dbx_drivers::ssh_config;
+pub use dbx_formats::sql_file_zip_package;
+pub use dbx_formats::temporal_format;
+pub use dbx_formats::text_export;
+pub use dbx_formats::xlsx_export;
+pub use dbx_sql::schema_diff;
+pub use dbx_sql::sql;
+pub use dbx_sql::sql_analysis;
+pub use dbx_sql::sql_diagnostics;
+pub use dbx_sql::sql_dialect;
+pub use dbx_sql::sql_editability;
+pub use dbx_sql::sql_error_position;
+pub use dbx_sql::sql_parser;
+pub use dbx_sql::sql_risk;
+pub(crate) use dbx_sql::sqlserver_temporal;
+pub use dbx_types::types;
+pub use host::update;
+pub use persistence::state_persistence;
+pub use persistence::storage;
+pub use query::two_phase_commit;
+pub use safety::write_unlock;
+pub use schema::table_structure_sql;
 
-pub const R2_CDN_BASE: &str = "https://dl.dbxio.com/";
-
-pub fn download_candidate_urls(github_url: &str, r2_path: &str) -> Vec<String> {
-    vec![format!("{R2_CDN_BASE}{r2_path}"), github_url.to_string()]
-}
-
-use std::pin::Pin;
-
-type ResponseFuture = Pin<Box<dyn std::future::Future<Output = Result<reqwest::Response, String>> + Send>>;
-
-pub async fn race_download(
-    client: &reqwest::Client,
-    github_url: &str,
-    r2_path: &str,
-    user_agent: &str,
-) -> Result<reqwest::Response, String> {
-    use futures::future::select_ok;
-
-    let urls = download_candidate_urls(github_url, r2_path);
-    let mut futs: Vec<ResponseFuture> = Vec::with_capacity(urls.len());
-
-    for url in urls {
-        let client = client.clone();
-        let ua = user_agent.to_string();
-        futs.push(Box::pin(async move {
-            client
-                .get(&url)
-                .header(reqwest::header::USER_AGENT, ua)
-                .send()
-                .await
-                .and_then(|r| r.error_for_status())
-                .map_err(|e| format!("{e}"))
-        }) as ResponseFuture);
-    }
-
-    match select_ok(futs).await {
-        Ok((resp, _)) => Ok(resp),
-        Err(last_err) => Err(last_err),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::download_candidate_urls;
-
-    #[test]
-    fn download_candidates_exclude_third_party_github_proxy() {
-        let urls = download_candidate_urls(
-            "https://github.com/t8y2/dbx/releases/latest/download/latest.json",
-            "releases/latest/latest.json",
-        );
-
-        assert_eq!(
-            urls,
-            vec![
-                "https://dl.dbxio.com/releases/latest/latest.json",
-                "https://github.com/t8y2/dbx/releases/latest/download/latest.json",
-            ]
-        );
-    }
-}
+pub use dbx_platform::download::{
+    download_candidate_urls, race_download, race_download_urls, DownloadSource, CNB_RELEASE_DOWNLOAD_PREFIX,
+    GITHUB_RELEASE_DOWNLOAD_PREFIX, R2_CDN_BASE,
+};

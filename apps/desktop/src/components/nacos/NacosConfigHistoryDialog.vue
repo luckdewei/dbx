@@ -5,6 +5,8 @@ import { useI18n } from "vue-i18n";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { formatNacosHistoryTime } from "@/lib/nacos/nacosAdmin";
+import NacosConfigCodeViewer from "@/components/nacos/NacosConfigCodeViewer.vue";
 import type { NacosConfigHistoryItem, NacosConfigItem } from "@/types/nacos";
 
 const open = defineModel<boolean>("open", { default: false });
@@ -21,6 +23,7 @@ const props = withDefaults(
     readOnly?: boolean;
     viewingItem?: NacosConfigHistoryItem | null;
     viewingContent?: string;
+    viewingFormat?: string;
     viewingLoading?: boolean;
   }>(),
   {
@@ -30,6 +33,7 @@ const props = withDefaults(
     readOnly: false,
     viewingItem: null,
     viewingContent: "",
+    viewingFormat: "",
     viewingLoading: false,
   },
 );
@@ -69,6 +73,10 @@ function display(value?: string | null) {
   return trimmed || "-";
 }
 
+function displayHistoryTime(value?: string | null) {
+  return formatNacosHistoryTime(value);
+}
+
 function operationLabel(value?: string) {
   const normalized = value?.trim().toLowerCase();
   if (!normalized) return "-";
@@ -89,17 +97,23 @@ function loadPage(pageNo: number) {
   <Dialog v-model:open="open">
     <DialogContent :show-close-button="false" class="nacos-config-history-dialog flex h-[min(82vh,760px)] flex-col gap-0 overflow-hidden rounded-lg p-0 shadow-2xl">
       <DialogHeader class="shrink-0 border-b bg-muted/20 px-5 py-4">
-        <div class="flex items-center justify-between gap-4">
+        <div class="flex items-start justify-between gap-4">
           <div class="flex min-w-0 items-start gap-3">
             <div class="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-md border bg-background text-primary">
               <Clock3 class="h-4 w-4" />
             </div>
             <div class="min-w-0">
               <DialogTitle class="truncate text-lg font-semibold">{{ t("nacos.configHistory") }}</DialogTitle>
-              <div class="mt-2 flex min-w-0 flex-wrap items-center gap-1.5 text-xs">
-                <Badge variant="outline" class="max-w-64 truncate font-mono">namespace={{ namespaceLabel }}</Badge>
-                <Badge variant="secondary" class="max-w-72 truncate font-mono">dataId={{ dataIdLabel }}</Badge>
-                <Badge variant="outline" class="max-w-48 truncate font-mono">group={{ groupLabel }}</Badge>
+              <div class="mt-1.5 flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                <span class="min-w-0 font-mono" :title="`namespace=${namespaceLabel}`"
+                  >namespace=<span class="break-all text-foreground">{{ namespaceLabel }}</span></span
+                >
+                <span class="min-w-0 font-mono" :title="`dataId=${dataIdLabel}`"
+                  >dataId=<span class="break-all text-foreground">{{ dataIdLabel }}</span></span
+                >
+                <span class="min-w-0 font-mono" :title="`group=${groupLabel}`"
+                  >group=<span class="break-all text-foreground">{{ groupLabel }}</span></span
+                >
               </div>
               <div class="sr-only">{{ historyTitle }}</div>
             </div>
@@ -128,7 +142,7 @@ function loadPage(pageNo: number) {
             <tr v-for="item in items" :key="`${item.historyId}:${item.nid ?? ''}`" class="border-b">
               <td class="max-w-72 truncate px-4 py-2 font-medium" :title="item.dataId">{{ item.dataId }}</td>
               <td class="max-w-44 truncate px-4 py-2 text-xs text-muted-foreground" :title="item.group">{{ item.group || "DEFAULT_GROUP" }}</td>
-              <td class="whitespace-nowrap px-4 py-2 text-xs text-muted-foreground">{{ display(item.lastModifiedTime) }}</td>
+              <td class="whitespace-nowrap px-4 py-2 text-xs text-muted-foreground" :title="display(item.lastModifiedTime)">{{ displayHistoryTime(item.lastModifiedTime) }}</td>
               <td class="max-w-40 truncate px-4 py-2 text-xs text-muted-foreground" :title="item.appName || ''">{{ display(item.appName) }}</td>
               <td class="px-4 py-2">
                 <Badge variant="outline">{{ operationLabel(item.operation) }}</Badge>
@@ -189,7 +203,7 @@ function loadPage(pageNo: number) {
           <div class="min-w-0 truncate font-mono" :title="viewingItem.namespace || 'public'">namespace={{ viewingItem.namespace || "public" }}</div>
           <div class="min-w-0 truncate font-mono" :title="viewingItem.dataId">dataId={{ viewingItem.dataId }}</div>
           <div class="min-w-0 truncate font-mono" :title="viewingItem.group || 'DEFAULT_GROUP'">group={{ viewingItem.group || "DEFAULT_GROUP" }}</div>
-          <div class="min-w-0 truncate" :title="display(viewingItem.lastModifiedTime)">{{ t("nacos.updatedAt") }}={{ display(viewingItem.lastModifiedTime) }}</div>
+          <div class="min-w-0 truncate" :title="display(viewingItem.lastModifiedTime)">{{ t("nacos.updatedAt") }}={{ displayHistoryTime(viewingItem.lastModifiedTime) }}</div>
         </div>
       </DialogHeader>
       <div class="min-h-0 flex-1 overflow-auto bg-muted/20 p-4">
@@ -197,7 +211,7 @@ function loadPage(pageNo: number) {
           <Loader2 class="mr-2 h-4 w-4 animate-spin" />
           {{ t("nacos.loadingHistory") }}
         </div>
-        <pre v-else class="min-h-full rounded-md border bg-background p-3 font-mono text-xs leading-5">{{ viewingContent || "" }}</pre>
+        <NacosConfigCodeViewer v-else :content="viewingContent || ''" :format="viewingFormat" :data-id="viewingItem?.dataId" class="min-h-full" />
       </div>
       <DialogFooter class="m-0 shrink-0 rounded-none border-t bg-background px-5 py-5 sm:py-4">
         <Button variant="outline" @click="detailOpen = false">{{ t("dangerDialog.cancel") }}</Button>
@@ -215,10 +229,5 @@ function loadPage(pageNo: number) {
 .nacos-config-history-detail-dialog {
   width: min(92vw, 1180px) !important;
   max-width: min(92vw, 1180px) !important;
-}
-
-.nacos-config-history-detail-dialog pre {
-  min-width: max-content;
-  white-space: pre;
 }
 </style>

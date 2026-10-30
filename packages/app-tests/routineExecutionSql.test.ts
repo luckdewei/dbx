@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
-import { buildProcedureExecutionSql, buildProcedureExecutionSqlFromValues } from "../../apps/desktop/src/lib/routineExecutionSql.ts";
-import { routineParametersFromResult, routineParametersQuery } from "../../apps/desktop/src/lib/routineParameters.ts";
+import { buildProcedureExecutionSql, buildProcedureExecutionSqlFromValues } from "../../apps/desktop/src/lib/table/routineExecutionSql.ts";
+import { routineParametersFromResult, routineParametersQuery } from "../../apps/desktop/src/lib/table/routineParameters.ts";
 
 test("builds procedure execution templates for common dialect families", () => {
   assert.equal(buildProcedureExecutionSql({ databaseType: "postgres", schema: "public", routineName: "refresh_stats" }), 'CALL "public"."refresh_stats"();');
@@ -36,7 +36,11 @@ test("builds procedure execution templates from parameter values", () => {
       routineName: "refresh_stats",
       parameters,
     }),
-    "EXEC [dbo].[refresh_stats] @p_message = 'it''s ready', @p_count = 3, @p_debug = 1;",
+    [
+      "DECLARE @dbx_output_4 text;",
+      "EXEC [dbo].[refresh_stats] @p_message = 'it''s ready', @p_count = 3, @p_debug = 1, @p_result = @dbx_output_4 OUTPUT;",
+      "SELECT @dbx_output_4 AS [p_result];",
+    ].join("\n"),
   );
 });
 

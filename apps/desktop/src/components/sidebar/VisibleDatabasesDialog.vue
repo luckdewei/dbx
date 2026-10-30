@@ -1,13 +1,24 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { CheckSquare, Loader2, Search, Square } from "@lucide/vue";
+import { Asterisk, CheckSquare, Loader2, Search, Square } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { useConnectionStore } from "@/stores/connectionStore";
-import { canSaveVisibleDatabaseSelection, connectionUsesVisibleSchemaFilter, filterDatabaseNamesForConnection, isSystemDatabaseName, normalizeVisibleDatabaseSelection } from "@/lib/visibleDatabases";
-import * as api from "@/lib/api";
+import {
+  canSaveVisibleDatabaseSelection,
+  connectionUsesVisibleSchemaFilter,
+  databaseNameMatchesVisiblePatterns,
+  filterDatabaseNamesForVisiblePicker,
+  filterSchemaNamesForVisiblePicker,
+  MATCH_ALL_VISIBLE_DATABASE_PATTERN,
+  normalizeVisibleDatabaseSelection,
+  parseVisibleDatabasePatternsInput,
+} from "@/lib/database/visibleDatabases";
+import { initialVisibleDatabaseSelection } from "@/lib/connection/connectionVisibleDatabases";
+import { resolveVisibleDatabaseSaveAction, visibleDatabasePatternsWithoutMatchAll } from "./visibleDatabasesDialogState";
+import * as api from "@/lib/backend/api";
 
 const props = defineProps<{
   open: boolean;
@@ -26,6 +37,7 @@ type FilterMode = "database" | "schema";
 
 const objectNames = ref<string[]>([]);
 const selectedNames = ref<Set<string>>(new Set());
+const patternInput = ref("");
 const searchText = ref("");
 const showSystemDatabases = ref(false);
 const isLoading = ref(false);
@@ -40,25 +52,31 @@ const descriptionKey = computed(() => (isSchemaFilterMode.value ? "visibleSchema
 const searchPlaceholderKey = computed(() => (isSchemaFilterMode.value ? "visibleSchemas.searchPlaceholder" : "visibleDatabases.searchPlaceholder"));
 const emptySelectionKey = computed(() => (isSchemaFilterMode.value ? "visibleSchemas.emptySelection" : "visibleDatabases.emptySelection"));
 const loadFailedKey = computed(() => (isSchemaFilterMode.value ? "visibleSchemas.loadFailed" : "visibleDatabases.loadFailed"));
-const listedObjectNames = computed(() => {
-  if (isSchemaFilterMode.value) return objectNames.value;
-  if (showSystemDatabases.value) return objectNames.value;
-  return filterDatabaseNamesForConnection(objectNames.value, connection.value);
+const showSystemObjectsKey = computed(() => (isSchemaFilterMode.value ? "visibleSchemas.showSystemSchemas" : "visibleDatabases.showSystemDatabases"));
+const defaultObjectNames = computed(() => {
+  if (isSchemaFilterMode.value) return filterSchemaNamesForVisiblePicker(objectNames.value, connection.value);
+  return filterDatabaseNamesForVisiblePicker(objectNames.value, connection.value);
 });
+const listedObjectNames = computed(() => (showSystemDatabases.value ? objectNames.value : defaultObjectNames.value));
 const filteredObjectNames = computed(() => {
   const query = searchText.value.trim().toLowerCase();
   if (!query) return listedObjectNames.value;
   return listedObjectNames.value.filter((name) => name.toLowerCase().includes(query));
 });
+const parsedPatterns = computed(() => parseVisibleDatabasePatternsInput(patternInput.value));
+const patternMatchCount = computed(() => {
+  if (parsedPatterns.value.length === 0) return 0;
+  return objectNames.value.filter((name) => databaseNameMatchesVisiblePatterns(name, parsedPatterns.value)).length;
+});
 const selectedCount = computed(() => selectedNames.value.size);
 const totalCount = computed(() => listedObjectNames.value.length);
 const canSaveSelection = computed(() => canSaveVisibleDatabaseSelection([...selectedNames.value]));
-const hasSystemDatabases = computed(() => !isSchemaFilterMode.value && objectNames.value.some((database) => isSystemDatabaseName(connection.value?.db_type, database)));
+const hasSystemObjects = computed(() => defaultObjectNames.value.length < objectNames.value.length);
 const showAllDisabled = computed(() => {
   if (isSchemaFilterMode.value) {
     return !connection.value?.visible_schemas?.[databaseKey.value];
   }
-  return !Array.isArray(connection.value?.visible_databases);
+  return !Array.isArray(connection.value?.visible_databases) && parsedPatterns.value.length === 0;
 });
 
 watch(
@@ -67,11 +85,14 @@ watch(
     if (!open) return;
     loadDatabases().catch(() => {});
   },
+  // Tree-level async hosts mount the dialog with `open` already true.
+  { immediate: true },
 );
 
 watch(showSystemDatabases, (show) => {
   if (show) return;
-  selectedNames.value = new Set([...selectedNames.value].filter((database) => !isSystemDatabaseName(connection.value?.db_type, database)));
+  const visible = new Set(listedObjectNames.value);
+  selectedNames.value = new Set([...selectedNames.value].filter((name) => visible.has(name)));
 });
 
 async function loadDatabases() {
@@ -80,11 +101,15 @@ async function loadDatabases() {
   searchText.value = "";
   try {
     const names = await loadObjectNames();
+    connectionStore.recordPrimaryVisibleObjectNames(props.connectionId, names);
     objectNames.value = names;
+    showSystemDatabases.value = false;
     const configured = isSchemaFilterMode.value ? connection.value?.visible_schemas?.[databaseKey.value] : connection.value?.visible_databases;
-    const initialSelection = Array.isArray(configured) ? normalizeVisibleDatabaseSelection(configured, names) : listedObjectNames.value;
+    patternInput.value = isSchemaFilterMode.value ? "" : (connection.value?.visible_database_patterns?.join(", ") ?? "");
+    const initialSelection = isSchemaFilterMode.value ? (Array.isArray(configured) ? normalizeVisibleDatabaseSelection(configured, names) : listedObjectNames.value) : initialVisibleDatabaseSelection(names, configured, connection.value);
     selectedNames.value = new Set(initialSelection);
-    showSystemDatabases.value = !isSchemaFilterMode.value && initialSelection.some((database) => isSystemDatabaseName(connection.value?.db_type, database));
+    const defaultVisible = new Set(defaultObjectNames.value);
+    showSystemDatabases.value = initialSelection.some((name) => !defaultVisible.has(name));
   } catch (e: any) {
     objectNames.value = [];
     selectedNames.value = new Set();
@@ -135,6 +160,10 @@ function clearSelection() {
 async function showAllDatabases() {
   if (isSchemaFilterMode.value) {
     await connectionStore.clearVisibleSchemas(props.connectionId, databaseKey.value);
+  } else if (showSystemDatabases.value && hasSystemObjects.value) {
+    // 未筛选时系统库默认隐藏；用全匹配通配符保留“显示全部（含系统库）”，
+    // 同时不冻结当前库名，之后新建的库仍会自动出现。
+    await connectionStore.setVisibleDatabaseFilter(props.connectionId, undefined, [MATCH_ALL_VISIBLE_DATABASE_PATTERN]);
   } else {
     await connectionStore.clearVisibleDatabases(props.connectionId);
   }
@@ -145,8 +174,27 @@ async function saveSelection() {
   if (!canSaveSelection.value) return;
   if (isSchemaFilterMode.value) {
     await connectionStore.setVisibleSchemas(props.connectionId, databaseKey.value, normalizeVisibleDatabaseSelection([...selectedNames.value], objectNames.value));
+    emit("update:open", false);
+    return;
+  }
+  // 勾选等于"默认可见库"且没有通配符时等价于不筛选：不能存成当时的库名快照，
+  // 否则之后新建的库永远不会出现在侧边栏（用户视角就是"库丢了"）。
+  const action = resolveVisibleDatabaseSaveAction({
+    selection: selectedNames.value,
+    allNames: objectNames.value,
+    defaultVisibleNames: defaultObjectNames.value,
+    configured: connection.value?.visible_databases,
+    configuredPatterns: connection.value?.visible_database_patterns,
+    patterns: visibleDatabasePatternsWithoutMatchAll(parsedPatterns.value),
+  });
+  if (action.type === "none") {
+    emit("update:open", false);
+    return;
+  }
+  if (action.type === "clear") {
+    await connectionStore.clearVisibleDatabases(props.connectionId);
   } else {
-    await connectionStore.setVisibleDatabases(props.connectionId, [...selectedNames.value]);
+    await connectionStore.setVisibleDatabaseFilter(props.connectionId, action.databaseNames, action.patterns);
   }
   emit("update:open", false);
 }
@@ -165,6 +213,17 @@ async function saveSelection() {
       <div class="flex items-center gap-2 rounded-md border bg-background px-2">
         <Search class="h-4 w-4 shrink-0 text-muted-foreground" />
         <Input v-model="searchText" :placeholder="t(searchPlaceholderKey)" class="h-8 border-0 px-0 shadow-none focus-visible:ring-0" :disabled="isLoading || !!errorMessage" />
+      </div>
+
+      <!-- 通配符模式：与勾选取并集，命中的库（含之后新建的）始终显示（#7164） -->
+      <div v-if="!isSchemaFilterMode" class="space-y-1">
+        <div class="flex items-center gap-2 rounded-md border bg-background px-2" :title="t('visibleDatabases.patternsHint')">
+          <Asterisk class="h-4 w-4 shrink-0 text-muted-foreground" />
+          <Input v-model="patternInput" data-visible-database-patterns :placeholder="t('visibleDatabases.patternsPlaceholder')" class="h-8 border-0 px-0 shadow-none focus-visible:ring-0" :disabled="isLoading || !!errorMessage" />
+        </div>
+        <p class="px-1 text-xs text-muted-foreground">
+          {{ t("visibleDatabases.patternsHint") }}<template v-if="parsedPatterns.length > 0"> · {{ t("visibleDatabases.patternsMatchCount", { count: patternMatchCount }) }}</template>
+        </p>
       </div>
 
       <div class="flex items-center justify-between text-xs text-muted-foreground">
@@ -188,9 +247,9 @@ async function saveSelection() {
         {{ t(emptySelectionKey) }}
       </p>
 
-      <label v-if="hasSystemDatabases" class="flex h-8 items-center gap-2 rounded-md px-1 text-xs text-muted-foreground">
+      <label v-if="hasSystemObjects" class="flex h-8 items-center gap-2 rounded-md px-1 text-xs text-muted-foreground">
         <input v-model="showSystemDatabases" type="checkbox" class="h-3.5 w-3.5 accent-primary" :disabled="isLoading || !!errorMessage" />
-        <span>{{ t("visibleDatabases.showSystemDatabases") }}</span>
+        <span>{{ t(showSystemObjectsKey) }}</span>
       </label>
 
       <div class="h-72 overflow-y-auto rounded-md border bg-background/50 p-1">

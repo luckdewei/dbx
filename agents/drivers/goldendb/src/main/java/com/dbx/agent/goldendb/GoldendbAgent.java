@@ -1,6 +1,6 @@
 package com.dbx.agent.goldendb;
 
-import com.dbx.agent.BaseDatabaseAgent;
+import com.dbx.agent.AbstractJdbcAgent;
 import com.dbx.agent.ColumnInfo;
 import com.dbx.agent.ConnectParams;
 import com.dbx.agent.DatabaseInfo;
@@ -9,14 +9,14 @@ import com.dbx.agent.ForeignKeyInfo;
 import com.dbx.agent.IndexInfo;
 import com.dbx.agent.JdbcExecutor;
 import com.dbx.agent.JdbcIdentifiers;
-import com.dbx.agent.JsonRpcServer;
+import com.dbx.agent.MultiSessionJsonRpcServer;
+import com.dbx.agent.MetadataListConstraints;
+import com.dbx.agent.MetadataSqlSupport;
 import com.dbx.agent.ObjectInfo;
 import com.dbx.agent.ObjectSource;
 import com.dbx.agent.QueryResult;
 import com.dbx.agent.TableInfo;
 import com.dbx.agent.TriggerInfo;
-import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.Types;
 import java.util.ArrayList;
@@ -28,30 +28,15 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.HashSet;
 
-public final class GoldendbAgent extends BaseDatabaseAgent {
-    private Connection connection;
-
+public final class GoldendbAgent extends AbstractJdbcAgent {
     @Override
-    public Connection getConnection() {
-        return connection;
+    protected String driverClass() {
+        return "com.mysql.cj.jdbc.Driver";
     }
 
     @Override
-    public void connect(ConnectParams params) {
-        uncheckedVoid(() -> {
-            Class.forName("com.mysql.cj.jdbc.Driver");
-            connection = DriverManager.getConnection(buildUrl(params), params.getUsername(), params.getPassword());
-        });
-    }
-
-    @Override
-    public boolean testConnection(ConnectParams params) {
-        return unchecked(() -> {
-            Class.forName("com.mysql.cj.jdbc.Driver");
-            try (Connection conn = DriverManager.getConnection(buildUrl(params), params.getUsername(), params.getPassword())) {
-                return conn.isValid(5);
-            }
-        });
+    protected String buildJdbcUrl(ConnectParams params) {
+        return buildUrl(params);
     }
 
     @Override
@@ -100,11 +85,49 @@ public final class GoldendbAgent extends BaseDatabaseAgent {
     }
 
     @Override
+    public List<TableInfo> listTables(String schema, MetadataListConstraints constraints) {
+        MetadataListConstraints normalized = MetadataListConstraints.orNone(constraints);
+        if (isUnconstrained(normalized)) {
+            return listTables(schema);
+        }
+        if (!normalized.includesTableLikeTypes()) {
+            return List.of();
+        }
+        try {
+            return queryConstrainedTables(schema, normalized);
+        } catch (RuntimeException e) {
+            return normalized.filterTables(listTables(schema));
+        }
+    }
+
+    private List<TableInfo> queryConstrainedTables(String schema, MetadataListConstraints constraints) {
+        return unchecked(() -> {
+            List<TableInfo> result = new ArrayList<>();
+            List<Object> args = new ArrayList<>();
+            StringBuilder sql = new StringBuilder("SELECT TABLE_NAME, TABLE_TYPE, TABLE_COMMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?");
+            args.add(schema);
+            appendInformationSchemaTableTypePredicate(sql, args, constraints);
+            MetadataSqlSupport.appendNameFilter(sql, args, "TABLE_NAME", constraints);
+            sql.append(" ORDER BY TABLE_NAME");
+            MetadataSqlSupport.appendLiteralLimitOffset(sql, constraints);
+            try (java.sql.PreparedStatement stmt = requireConnected().prepareStatement(sql.toString())) {
+                MetadataSqlSupport.bind(stmt, args);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        result.add(new TableInfo(rs.getString("TABLE_NAME"), normalizeTableType(rs.getString("TABLE_TYPE")), emptyToNull(rs.getString("TABLE_COMMENT"))));
+                    }
+                }
+            }
+            return constraints.withoutPaging().filterTables(result);
+        });
+    }
+
+    @Override
     public List<ObjectInfo> listObjects(String schema) {
         return unchecked(() -> {
             List<ObjectInfo> result = new ArrayList<>();
             for (TableInfo table : listTables(schema)) {
-                result.add(new ObjectInfo(table.getName(), table.getTable_type(), schema, table.getComment()));
+                result.add(new ObjectInfo(table.getName(), table.getTable_type(), schema, table.getComment(), table.getValid()));
             }
 
             try (java.sql.PreparedStatement stmt = requireConnected().prepareStatement(
@@ -118,6 +141,80 @@ public final class GoldendbAgent extends BaseDatabaseAgent {
                 }
             }
             return result;
+        });
+    }
+
+    @Override
+    public List<ObjectInfo> listObjects(String schema, MetadataListConstraints constraints) {
+        MetadataListConstraints normalized = MetadataListConstraints.orNone(constraints);
+        if (isUnconstrained(normalized)) {
+            return listObjects(schema);
+        }
+        if (!includesSupportedObjects(normalized)) {
+            return List.of();
+        }
+        try {
+            return queryConstrainedObjects(schema, normalized);
+        } catch (RuntimeException e) {
+            return normalized.filterObjects(listObjects(schema));
+        }
+    }
+
+    private List<ObjectInfo> queryConstrainedObjects(String schema, MetadataListConstraints constraints) {
+        return unchecked(() -> {
+            List<ObjectInfo> result = new ArrayList<>();
+            List<String> branches = new ArrayList<>();
+            List<Object> args = new ArrayList<>();
+            if (constraints.includesTableLikeTypes()) {
+                StringBuilder tableSql = new StringBuilder("SELECT TABLE_NAME AS OBJECT_NAME, TABLE_TYPE AS OBJECT_TYPE, TABLE_COMMENT AS OBJECT_COMMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?");
+                args.add(schema);
+                appendInformationSchemaTableTypePredicate(tableSql, args, constraints);
+                MetadataSqlSupport.appendNameFilter(tableSql, args, "TABLE_NAME", constraints);
+                branches.add(tableSql.toString());
+            }
+            if (constraints.objectTypeAllowed("PROCEDURE") || constraints.objectTypeAllowed("FUNCTION")) {
+                StringBuilder routineSql = new StringBuilder("SELECT ROUTINE_NAME AS OBJECT_NAME, ROUTINE_TYPE AS OBJECT_TYPE, NULL AS OBJECT_COMMENT FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = ?");
+                args.add(schema);
+                appendRoutineTypePredicate(routineSql, args, constraints);
+                MetadataSqlSupport.appendNameFilter(routineSql, args, "ROUTINE_NAME", constraints);
+                branches.add(routineSql.toString());
+            }
+            if (branches.isEmpty()) {
+                return List.of();
+            }
+            StringBuilder sql = new StringBuilder("SELECT OBJECT_NAME, OBJECT_TYPE, OBJECT_COMMENT FROM (")
+                .append(String.join(" UNION ALL ", branches))
+                .append(") metadata_objects ORDER BY CASE OBJECT_TYPE WHEN 'BASE TABLE' THEN 0 WHEN 'TABLE' THEN 0 WHEN 'VIEW' THEN 1 WHEN 'PROCEDURE' THEN 2 WHEN 'FUNCTION' THEN 3 ELSE 9 END, OBJECT_NAME");
+            MetadataSqlSupport.appendLiteralLimitOffset(sql, constraints);
+            try (java.sql.PreparedStatement stmt = requireConnected().prepareStatement(sql.toString())) {
+                MetadataSqlSupport.bind(stmt, args);
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        result.add(new ObjectInfo(rs.getString("OBJECT_NAME"), normalizeTableType(rs.getString("OBJECT_TYPE")), schema, emptyToNull(rs.getString("OBJECT_COMMENT"))));
+                    }
+                }
+            }
+            return constraints.withoutPaging().filterObjects(result);
+        });
+    }
+
+    @Override
+    public String getTableDdl(String schema, String table) {
+        return unchecked(() -> {
+            String qualifiedTable = JdbcIdentifiers.INSTANCE.backtick(table);
+            if (schema != null && !schema.isBlank()) {
+                qualifiedTable = JdbcIdentifiers.INSTANCE.backtick(schema) + "." + qualifiedTable;
+            }
+            try (java.sql.Statement statement = requireConnected().createStatement();
+                 ResultSet result = statement.executeQuery("SHOW CREATE TABLE " + qualifiedTable)) {
+                if (result.next()) {
+                    String ddl = result.getString(2);
+                    if (ddl != null && !ddl.isBlank()) {
+                        return ddl;
+                    }
+                }
+                throw new IllegalStateException("DDL not found for " + qualifiedTable);
+            }
         });
     }
 
@@ -171,7 +268,8 @@ public final class GoldendbAgent extends BaseDatabaseAgent {
             try (java.sql.PreparedStatement stmt = requireConnected().prepareStatement(
                 """
                 SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, COLUMN_COMMENT,
-                       NUMERIC_PRECISION, NUMERIC_SCALE, CHARACTER_MAXIMUM_LENGTH
+                       NUMERIC_PRECISION, NUMERIC_SCALE, CHARACTER_MAXIMUM_LENGTH,
+                       CHARACTER_SET_NAME, COLLATION_NAME
                 FROM information_schema.COLUMNS
                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
                 ORDER BY ORDINAL_POSITION
@@ -192,7 +290,9 @@ public final class GoldendbAgent extends BaseDatabaseAgent {
                             emptyToNull(rs.getString("COLUMN_COMMENT")),
                             integerOrNull(rs, "NUMERIC_PRECISION"),
                             integerOrNull(rs, "NUMERIC_SCALE"),
-                            numberToIntOrNull(rs, "CHARACTER_MAXIMUM_LENGTH")
+                            numberToIntOrNull(rs, "CHARACTER_MAXIMUM_LENGTH"),
+                            emptyToNull(rs.getString("CHARACTER_SET_NAME")),
+                            emptyToNull(rs.getString("COLLATION_NAME"))
                         ));
                     }
                 }
@@ -312,7 +412,7 @@ public final class GoldendbAgent extends BaseDatabaseAgent {
 
     @Override
     public QueryResult executeQuery(String sql, String schema, ExecuteQueryOptions options) {
-        return JdbcExecutor.INSTANCE.execute(
+        return JdbcExecutor.current().execute(
             requireConnected(),
             sql,
             schema,
@@ -330,16 +430,7 @@ public final class GoldendbAgent extends BaseDatabaseAgent {
     }
 
     @Override
-    public void disconnect() {
-        uncheckedVoid(() -> {
-            if (connection != null) {
-                connection.close();
-            }
-            connection = null;
-        });
-    }
-
-    private Object resultValue(ResultSet rs, int index, int sqlType) {
+    protected Object resultValue(ResultSet rs, int index, int sqlType) {
         return unchecked(() -> {
             Object value;
             switch (sqlType) {
@@ -366,6 +457,12 @@ public final class GoldendbAgent extends BaseDatabaseAgent {
                 case Types.BIT:
                     value = rs.getBoolean(index);
                     break;
+                case Types.BINARY:
+                case Types.VARBINARY:
+                case Types.LONGVARBINARY:
+                case Types.BLOB:
+                    value = JdbcExecutor.bytesToHex(rs.getBytes(index));
+                    break;
                 default:
                     value = rs.getString(index);
                     break;
@@ -377,6 +474,58 @@ public final class GoldendbAgent extends BaseDatabaseAgent {
     private static String buildUrl(ConnectParams params) {
         return "jdbc:mysql://" + params.getHost() + ":" + params.getPort() + "/" + params.getDatabase()
             + "?useSSL=false&allowPublicKeyRetrieval=true";
+    }
+
+    private static boolean isUnconstrained(MetadataListConstraints constraints) {
+        return !constraints.hasFilter() && !constraints.hasLimit() && !constraints.hasOffset() && !constraints.hasObjectTypes();
+    }
+
+    private static boolean includesSupportedObjects(MetadataListConstraints constraints) {
+        return constraints.includesTableLikeTypes()
+            || constraints.objectTypeAllowed("PROCEDURE")
+            || constraints.objectTypeAllowed("FUNCTION");
+    }
+
+    private static void appendInformationSchemaTableTypePredicate(StringBuilder sql, List<Object> args, MetadataListConstraints constraints) {
+        if (!constraints.hasObjectTypes()) {
+            return;
+        }
+        List<String> types = new ArrayList<>();
+        if (constraints.tableTypeAllowed("TABLE")) {
+            types.add("BASE TABLE");
+        }
+        if (constraints.tableTypeAllowed("VIEW")) {
+            types.add("VIEW");
+        }
+        if (types.isEmpty()) {
+            sql.append(" AND 1 = 0");
+            return;
+        }
+        sql.append(" AND TABLE_TYPE IN (").append(MetadataSqlSupport.placeholders(types.size())).append(")");
+        args.addAll(types);
+    }
+
+    private static void appendRoutineTypePredicate(StringBuilder sql, List<Object> args, MetadataListConstraints constraints) {
+        if (!constraints.hasObjectTypes()) {
+            return;
+        }
+        List<String> types = new ArrayList<>();
+        if (constraints.objectTypeAllowed("PROCEDURE")) {
+            types.add("PROCEDURE");
+        }
+        if (constraints.objectTypeAllowed("FUNCTION")) {
+            types.add("FUNCTION");
+        }
+        if (types.isEmpty()) {
+            sql.append(" AND 1 = 0");
+            return;
+        }
+        sql.append(" AND ROUTINE_TYPE IN (").append(MetadataSqlSupport.placeholders(types.size())).append(")");
+        args.addAll(types);
+    }
+
+    private static String normalizeTableType(String tableType) {
+        return "BASE TABLE".equals(tableType) ? "TABLE" : tableType;
     }
 
     private static String emptyToNull(String value) {
@@ -404,6 +553,6 @@ public final class GoldendbAgent extends BaseDatabaseAgent {
     }
 
     public static void main(String[] args) {
-        new JsonRpcServer(new GoldendbAgent()).run();
+        new MultiSessionJsonRpcServer(GoldendbAgent::new).run();
     }
 }

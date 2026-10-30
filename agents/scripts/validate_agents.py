@@ -11,23 +11,36 @@ SOURCE_GLOBS = ("*/src/main/**/*.java", "drivers/*/src/main/**/*.java")
 KOTLIN_FILE_SUFFIXES = (".kt", ".kts")
 KOTLIN_SCAN_EXCLUDED_PARTS = {".git", ".gradle", "build"}
 DEFAULT_AGENT_JRE_KEY = "21"
-LEGACY_ORACLE_JRE_KEY = "8"
-NON_JDBC_AGENT_MODULES = {"mongodb", "etcd", "zookeeper"}
-NATIVE_ONLY_AGENT_MODULES = {"xugu"}
+NON_JDBC_AGENT_MODULES = {"mongodb", "zookeeper", "kafka", "rocketmq", "rabbitmq"}
+NATIVE_ONLY_AGENT_MODULES = {
+    "cassandra": "drivers/cassandra-go",
+    "duckdb": "drivers/duckdb",
+    "hive": "drivers/hive-go",
+    "argo": "drivers/argo-go",
+    "oracle": "drivers/oracle-go",
+    "oracle-oci": "drivers/oracle-go",
+    "kingbase": "drivers/kingbase-go",
+    "iotdb": "drivers/iotdb",
+    "neo4j": "drivers/neo4j-go",
+    "nebula": "drivers/nebula-go",
+    "vastbase": "drivers/vastbase-go",
+    "tdengine": "drivers/tdengine",
+    "xugu": "drivers/xugu",
+    "rabbitmq": "drivers/rabbitmq",
+    "rocketmq": "drivers/rocketmq",
+    "zookeeper": "drivers/zookeeper",
+    "etcd": "drivers/etcd-go",
+    "etcd2": "drivers/etcd2-go",
+}
+CRATE_NATIVE_AGENT_MODULES = {
+    "sqlite-worker": Path("..") / "crates" / "dbx-sqlite-worker",
+}
+AUTO_VERSIONED_NATIVE_MODULES = {"duckdb"}
 JDBC_ARCHITECTURE_ALLOWLIST = {
-    "access": "custom Access metadata and URL behavior pending migration",
-    "dameng": "custom Dameng metadata and DDL pending migration",
-    "db2": "custom DB2 metadata pending migration",
-    "gaussdb": "custom GaussDB metadata pending migration",
-    "gbase8s": "custom GBase 8s metadata pending migration",
-    "goldendb": "custom GoldenDB metadata pending migration",
-    "informix": "custom Informix metadata pending migration",
-    "neo4j": "custom Neo4j transaction/query behavior pending migration",
-    "oracle": "custom Oracle metadata and connection properties pending migration",
-    "oracle-legacy": "custom Oracle legacy metadata and connection properties pending migration",
-    "oracle-10g": "custom Oracle 10g metadata and Java 8 runtime pending migration",
-    "sundb": "custom SunDB metadata pending migration",
-    "tdengine": "custom TDengine WebSocket JDBC behavior pending migration",
+    "h2-legacy": "reuses the H2 agent implementation with an isolated legacy driver version",
+    "access": "shared lifecycle with a test-only non-creating Access URL",
+    "dameng": "shared lifecycle with protocol-safe driver loading and native explain access",
+    "informix": "shared lifecycle with contextual connection error reporting",
 }
 APPROVED_JDBC_BASES = {
     "AbstractJdbcAgent",
@@ -68,12 +81,24 @@ def included_agent_modules(root: Path) -> set[str]:
     return included - INFRA_MODULES
 
 
+def crate_native_modules(root: Path) -> set[str]:
+    return {name for name, path in CRATE_NATIVE_AGENT_MODULES.items() if (root / path).exists()}
+
+
+def skipped_native_modules() -> set[str]:
+    return set(NATIVE_ONLY_AGENT_MODULES) | set(CRATE_NATIVE_AGENT_MODULES)
+
+
 def agent_modules(root: Path) -> set[str]:
-    native = {name for name in NATIVE_ONLY_AGENT_MODULES if module_dir(root, name).exists()}
-    return included_agent_modules(root) | native
+    native = {name for name, path in NATIVE_ONLY_AGENT_MODULES.items() if (root / path).exists()}
+    return included_agent_modules(root) | native | crate_native_modules(root)
 
 
 def module_dir(root: Path, module: str) -> Path:
+    if module in NATIVE_ONLY_AGENT_MODULES:
+        return root / NATIVE_ONLY_AGENT_MODULES[module]
+    if module in CRATE_NATIVE_AGENT_MODULES:
+        return root / CRATE_NATIVE_AGENT_MODULES[module]
     nested = root / "drivers" / module
     if nested.exists():
         return nested
@@ -88,7 +113,10 @@ def validate_versions(root: Path) -> list[str]:
     included = agent_modules(root)
     versions = set(json.loads((root / "versions.json").read_text(encoding="utf-8")))
     return (
-        [f"included module missing version: {name}" for name in sorted(included - versions)]
+        [
+            f"included module missing version: {name}"
+            for name in sorted(included - versions - AUTO_VERSIONED_NATIVE_MODULES)
+        ]
         + [f"versions key not included: {name}" for name in sorted(versions - included)]
     )
 
@@ -127,7 +155,7 @@ def validate_manifest_fields(root: Path, modules: set[str]) -> list[str]:
         root_build_text,
     )
     for module in sorted(modules):
-        if module in NATIVE_ONLY_AGENT_MODULES:
+        if module in skipped_native_modules():
             continue
         build_file = module_relative_path(root, module, "build.gradle")
         relative = build_file.relative_to(root)
@@ -162,7 +190,7 @@ def validate_manifest_fields(root: Path, modules: set[str]) -> list[str]:
 
 def validate_jdbc_architecture(root: Path, modules: set[str]) -> list[str]:
     problems: list[str] = []
-    for module in sorted(modules - NON_JDBC_AGENT_MODULES - NATIVE_ONLY_AGENT_MODULES):
+    for module in sorted(modules - NON_JDBC_AGENT_MODULES - skipped_native_modules()):
         source = main_class_source(root, module)
         if source is None or not source.exists():
             continue
@@ -180,6 +208,25 @@ def validate_jdbc_architecture(root: Path, modules: set[str]) -> list[str]:
                 if pattern.search(line):
                     problems.append(f"{source.relative_to(root)}:{line_number}: {message}; use shared JDBC foundation")
     return problems
+
+
+def validate_jdbc_pool_coverage(root: Path, modules: set[str]) -> list[str]:
+    build_file = root / "build.gradle"
+    if not build_file.exists():
+        return []
+    match = re.search(
+        r"\bdef\s+pooledJdbcProjects\s*=\s*\[(.*?)\]\s*as\s+Set",
+        build_file.read_text(encoding="utf-8"),
+        flags=re.S,
+    )
+    if match is None:
+        return ["build.gradle: missing pooledJdbcProjects set"]
+    pooled = set(re.findall(r"['\"]([^'\"]+)['\"]", match.group(1)))
+    expected = modules - NON_JDBC_AGENT_MODULES - skipped_native_modules()
+    return (
+        [f"JDBC module missing pooled runtime dependency: {module}" for module in sorted(expected - pooled)]
+        + [f"non-JDBC module listed as pooled JDBC runtime: {module}" for module in sorted(pooled - expected)]
+    )
 
 
 def validate_authoring_template(root: Path) -> list[str]:
@@ -228,16 +275,28 @@ def validate_release_runtime_keys(root: Path) -> list[str]:
             f"release workflow must build the default JRE from Java {DEFAULT_AGENT_JRE_KEY}",
         ),
         (
-            rf'oracle-10g\)\s*echo\s*"{LEGACY_ORACLE_JRE_KEY}"',
-            f"oracle-10g must keep JRE key {LEGACY_ORACLE_JRE_KEY}",
-        ),
-        (
             rf'\*\)\s*echo\s*"{DEFAULT_AGENT_JRE_KEY}"',
-            f"non-legacy agents must use JRE key {DEFAULT_AGENT_JRE_KEY}",
+            f"agents must use JRE key {DEFAULT_AGENT_JRE_KEY}",
         ),
         (
             rf'"{DEFAULT_AGENT_JRE_KEY}":\s*\{{\s*"version":\s*"{DEFAULT_AGENT_JRE_KEY}\.',
             f"registry must publish Java {DEFAULT_AGENT_JRE_KEY} under JRE key {DEFAULT_AGENT_JRE_KEY}",
+        ),
+        (
+            r"jdk\.security\.auth",
+            "release workflow JRE must include jdk.security.auth for Kafka Kerberos LoginModule support",
+        ),
+        (
+            r"jdk\.security\.jgss",
+            "release workflow JRE must include jdk.security.jgss for Kafka GSSAPI SASL support",
+        ),
+        (
+            r"jdk\.crypto\.ec",
+            "release workflow JRE must include jdk.crypto.ec for Kafka EC TLS support",
+        ),
+        (
+            r'\["windows-aarch64"\]\s*=\s*"windows/aarch64"',
+            "release workflow must build the managed JRE for windows-aarch64",
         ),
         (
             r"legacy-placeholder\.jar",
@@ -249,7 +308,7 @@ def validate_release_runtime_keys(root: Path) -> list[str]:
             problems.append(message)
     forbidden_patterns = [
         (r'jre-key:\s*"17"', "release workflow must not build Java 21 under JRE key 17"),
-        (r'\*\)\s*echo\s*"17"', "non-legacy agents must not use JRE key 17"),
+        (r'\*\)\s*echo\s*"17"', "agents must not use JRE key 17"),
         (r'"17":\s*\{\s*"version":\s*"21\.', "registry must not publish Java 21 under JRE key 17"),
     ]
     for pattern, message in forbidden_patterns:
@@ -275,6 +334,7 @@ def validate(root: Path) -> list[str]:
         + validate_source_patterns(root)
         + validate_manifest_fields(root, modules)
         + validate_jdbc_architecture(root, modules)
+        + validate_jdbc_pool_coverage(root, modules)
         + validate_authoring_template(root)
         + validate_release_runtime_keys(root)
         + validate_no_kotlin_residue(root)

@@ -1,6 +1,8 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
-import { normalizeMongoConnectionString, parseConnectionUrl } from "../../apps/desktop/src/lib/connectionUrl.ts";
+import { applyParsedConnectionUrl, normalizeMongoConnectionString, parseConnectionUrl } from "../../apps/desktop/src/lib/connection/connectionUrl.ts";
+import { connectionUrlPlaceholder } from "../../apps/desktop/src/lib/connection/connectionPresentation.ts";
+import { h2FileJdbcUrlWithPath } from "../../apps/desktop/src/lib/database/h2Connection.ts";
 
 test("parses postgres connection URLs", () => {
   assert.deepEqual(parseConnectionUrl("postgresql://alice:secret@db.example.com:5433/app?sslmode=require"), {
@@ -32,6 +34,98 @@ test("parses KWDB connection URLs", () => {
   });
 });
 
+test("uses the Dameng display name without changing its connection profile", () => {
+  const parsed = parseConnectionUrl("dm://SYSDBA:password@127.0.0.1:5236/DAMENG");
+
+  assert.equal(parsed.dbType, "dameng");
+  assert.equal(parsed.driverProfile, "dm");
+  assert.equal(parsed.driverLabel, "达梦 Dameng");
+});
+
+test.each(["kingbase", "kingbase8", "jdbc:kingbase8"])("parses %s connection URLs as native KingBase connections", (scheme) => {
+  assert.deepEqual(parseConnectionUrl(`${scheme}://framework:secret@172.21.203.70:443/hq_official?sslmode=disable`), {
+    dbType: "kingbase",
+    driverProfile: "kingbase",
+    driverLabel: "金仓KingbaseES",
+    host: "172.21.203.70",
+    port: 443,
+    username: "framework",
+    password: "secret",
+    database: "hq_official",
+    urlParams: "sslmode=disable",
+    ssl: false,
+  });
+});
+
+test("shows the vendor KingBase URL scheme in the connection form", () => {
+  assert.equal(connectionUrlPlaceholder("kingbase"), "kingbase8://user:password@host:54321/database");
+});
+
+test("shows the H2 URL scheme in the connection form for tcp and file modes", () => {
+  assert.equal(connectionUrlPlaceholder("h2"), "jdbc:h2:tcp://host:9092/database");
+  assert.equal(connectionUrlPlaceholder("h2", "file"), "jdbc:h2:file:/path/to/database");
+  assert.equal(connectionUrlPlaceholder("h2", "h2"), "jdbc:h2:tcp://host:9092/database");
+});
+
+test("applies a credential-free KingBase URL without clearing typed credentials", () => {
+  const parsed = parseConnectionUrl("kingbase8://172.21.203.70:443/hq_official");
+  const applied = applyParsedConnectionUrl({ name: "hq", db_type: "kingbase", username: "framework", password: "typed-secret" } as any, parsed);
+
+  assert.equal(applied.host, "172.21.203.70");
+  assert.equal(applied.port, 443);
+  assert.equal(applied.database, "hq_official");
+  assert.equal(applied.username, "framework");
+  assert.equal(applied.password, "typed-secret");
+});
+
+test("applies a credential-free URL without clearing same-profile typed credentials", () => {
+  const parsed = parseConnectionUrl("postgresql://db.example.com:5433/app?sslmode=require");
+  const applied = applyParsedConnectionUrl({ name: "app", db_type: "postgres", username: "typed-user", password: "typed-secret" } as any, parsed);
+
+  assert.equal(applied.host, "db.example.com");
+  assert.equal(applied.port, 5433);
+  assert.equal(applied.database, "app");
+  assert.equal(applied.url_params, "sslmode=require");
+  assert.equal(applied.ssl, true);
+  assert.equal(applied.username, "typed-user");
+  assert.equal(applied.password, "typed-secret");
+});
+
+test("uses explicit URL credentials instead of same-profile typed credentials", () => {
+  const parsed = parseConnectionUrl("postgresql://url%40user:url%40secret@db.example.com/app");
+  const applied = applyParsedConnectionUrl({ name: "app", db_type: "postgres", username: "typed-user", password: "typed-secret" } as any, parsed);
+
+  assert.equal(applied.username, "url@user");
+  assert.equal(applied.password, "url@secret");
+});
+
+test("does not carry typed credentials to a different URL profile", () => {
+  const parsed = parseConnectionUrl("postgresql://db.example.com/app");
+  const applied = applyParsedConnectionUrl({ name: "app", db_type: "mysql", username: "mysql-user", password: "mysql-secret" } as any, parsed);
+
+  assert.equal(applied.db_type, "postgres");
+  assert.equal(applied.username, "");
+  assert.equal(applied.password, "");
+});
+
+test("does not carry typed credentials between driver profiles of the same database type", () => {
+  const parsed = parseConnectionUrl("mariadb://db.example.com/app");
+  const applied = applyParsedConnectionUrl({ name: "app", db_type: "mysql", driver_profile: "mysql", username: "mysql-user", password: "mysql-secret" } as any, parsed);
+
+  assert.equal(applied.db_type, "mysql");
+  assert.equal(applied.driver_profile, "mariadb");
+  assert.equal(applied.username, "");
+  assert.equal(applied.password, "");
+});
+
+test("keeps empty same-profile form credentials empty for a credential-free URL", () => {
+  const parsed = parseConnectionUrl("postgresql://db.example.com/app");
+  const applied = applyParsedConnectionUrl({ name: "app", db_type: "postgres", username: "", password: "" } as any, parsed);
+
+  assert.equal(applied.username, "");
+  assert.equal(applied.password, "");
+});
+
 test("parses mysql URLs with encoded credentials", () => {
   const parsed = parseConnectionUrl("mysql://root:p%40ss@127.0.0.1/shop?charset=utf8mb4");
 
@@ -45,9 +139,44 @@ test("parses mysql URLs with encoded credentials", () => {
   assert.equal(parsed.urlParams, "charset=utf8mb4");
 });
 
+test("parses mysql URL name as decoded connection name", () => {
+  const parsed = parseConnectionUrl("mysql://root:123456@localhost/?name=%E5%85%AC%E5%8F%B8+-+%E6%9C%AC%E5%9C%B0Docker&charset=utf8mb4");
+
+  assert.equal(parsed.name, "公司 - 本地Docker");
+  assert.equal(parsed.host, "localhost");
+  assert.equal(parsed.username, "root");
+  assert.equal(parsed.password, "123456");
+  assert.equal(parsed.urlParams, "charset=utf8mb4");
+});
+
+test("consumes mysql URL name when it is the only URL param", () => {
+  const parsed = parseConnectionUrl("mysql://root:123456@localhost/?name=%E5%85%AC%E5%8F%B8+-+%E6%9C%AC%E5%9C%B0Docker");
+
+  assert.equal(parsed.name, "公司 - 本地Docker");
+  assert.equal(parsed.urlParams, "");
+});
+
+test("removes only the connection name from URL params", () => {
+  const parsed = parseConnectionUrl("mysql://root@localhost/app?Name=Analytics+Local&ssl-mode=required");
+
+  assert.equal(parsed.name, "Analytics Local");
+  assert.equal(parsed.database, "app");
+  assert.equal(parsed.urlParams, "ssl-mode=required");
+  assert.equal(parsed.ssl, true);
+});
+
 test("parses mysql TLS URL params into the SSL switch state", () => {
   assert.equal(parseConnectionUrl("mysql://root@tidb.example.com:4000/test?ssl-mode=required").ssl, true);
   assert.equal(parseConnectionUrl("mysql://root@tidb.example.com:4000/test?require_ssl=true").ssl, true);
+  assert.equal(parseConnectionUrl("jdbc:mysql://db.example.com/test?useSSL=true&requireSSL=true&verifyServerCertificate=true").ssl, true);
+  assert.equal(parseConnectionUrl("jdbc:mysql://db.example.com/test?verifyServerCertificate=true").ssl, true);
+  assert.equal(parseConnectionUrl("jdbc:mysql://db.example.com/test?useSSL=false").ssl, false);
+  assert.equal(parseConnectionUrl("jdbc:mysql://db.example.com/test?useSSL=false&requireSSL=true&verifyServerCertificate=true").ssl, false);
+});
+
+test("uses the last duplicate MySQL JDBC TLS parameter", () => {
+  assert.equal(parseConnectionUrl("jdbc:mysql://db.example.com/test?useSSL=false&useSSL=true&requireSSL=true").ssl, true);
+  assert.equal(parseConnectionUrl("jdbc:mysql://db.example.com/test?useSSL=true&useSSL=false&requireSSL=true").ssl, false);
 });
 
 test("parses TiDB Cloud MySQL URLs as TLS connections", () => {
@@ -67,6 +196,83 @@ test("parses MySQL JDBC user and password URL params as credentials", () => {
   assert.equal(parsed.password, "pwd");
   assert.equal(parsed.database, "example");
   assert.equal(parsed.urlParams, "useUnicode=true&characterEncoding=UTF8&useSSL=false");
+});
+
+test("parses OceanBase native JDBC URLs", () => {
+  const parsed = parseConnectionUrl("jdbc:oceanbase://127.0.0.1:2881/test");
+
+  assert.equal(parsed.dbType, "mysql");
+  assert.equal(parsed.driverProfile, "oceanbase");
+  assert.equal(parsed.driverLabel, "OceanBase");
+  assert.equal(parsed.host, "127.0.0.1");
+  assert.equal(parsed.port, 2881);
+  assert.equal(parsed.database, "test");
+  assert.equal(parsed.urlParams, "");
+});
+
+test("uses the OceanBase profile default port for non-JDBC URLs without an explicit port", () => {
+  assert.equal(parseConnectionUrl("oceanbase://127.0.0.1/test").port, 2883);
+});
+
+test("uses the OceanBase JDBC driver default port when the URL omits it", () => {
+  assert.equal(parseConnectionUrl("jdbc:oceanbase://127.0.0.1/test").port, 3306);
+});
+
+test("parses OceanBase JDBC user and password URL params as credentials", () => {
+  const parsed = parseConnectionUrl("jdbc:oceanbase://127.0.0.1:2881/test?user=root%40tenant&password=p%40ss&useUnicode=true");
+
+  assert.equal(parsed.username, "root@tenant");
+  assert.equal(parsed.password, "p@ss");
+  assert.equal(parsed.urlParams, "useUnicode=true");
+});
+
+test("preserves the selected OceanBase MySQL profile for native JDBC URLs", () => {
+  const parsed = parseConnectionUrl("jdbc:oceanbase://127.0.0.1:2881/test", "oceanbase");
+
+  assert.equal(parsed.dbType, "mysql");
+  assert.equal(parsed.driverProfile, "oceanbase");
+  assert.equal(parsed.driverLabel, "OceanBase");
+});
+
+test("preserves the selected OceanBase Oracle profile for native JDBC URLs", () => {
+  const parsed = parseConnectionUrl("jdbc:oceanbase://127.0.0.1:2881/sys?user=SYS&password=secret&useSSL=false", "oceanbase-oracle");
+
+  assert.equal(parsed.dbType, "oceanbase-oracle");
+  assert.equal(parsed.driverProfile, "oceanbase-oracle");
+  assert.equal(parsed.driverLabel, "OceanBase Oracle Mode");
+  assert.equal(parsed.username, "SYS");
+  assert.equal(parsed.password, "secret");
+  assert.equal(parsed.urlParams, "useSSL=false");
+});
+
+test("parses explicit OceanBase Oracle-mode JDBC URLs", () => {
+  const parsed = parseConnectionUrl("jdbc:oceanbase:oracle://ob.example.com/sys?user=SYS&password=secret&useSSL=false");
+
+  assert.equal(parsed.dbType, "oceanbase-oracle");
+  assert.equal(parsed.driverProfile, "oceanbase-oracle");
+  assert.equal(parsed.host, "ob.example.com");
+  assert.equal(parsed.port, 3306);
+  assert.equal(parsed.database, "sys");
+  assert.equal(parsed.username, "SYS");
+  assert.equal(parsed.password, "secret");
+  assert.equal(parsed.urlParams, "useSSL=false");
+});
+
+test("does not parse OceanBase load-balance JDBC URLs as single-host connections", () => {
+  assert.throws(() => parseConnectionUrl("jdbc:oceanbase:loadbalance://host1:2881,host2:2881/test"), /loadbalance/);
+  assert.throws(() => parseConnectionUrl("jdbc:oceanbase:oracle:loadbalance://host1:2881,host2:2881/sys"), /loadbalance/);
+});
+
+test("parses MySQL JDBC URL params with ProxySQL multi-at usernames", () => {
+  const parsed = parseConnectionUrl("jdbc:mysql://127.0.0.1:6033/example?user=xxxxx%40db_readonly%40127.0.0.1&password=p%40wd&useSSL=false");
+
+  assert.equal(parsed.dbType, "mysql");
+  assert.equal(parsed.host, "127.0.0.1");
+  assert.equal(parsed.port, 6033);
+  assert.equal(parsed.username, "xxxxx@db_readonly@127.0.0.1");
+  assert.equal(parsed.password, "p@wd");
+  assert.equal(parsed.database, "example");
+  assert.equal(parsed.urlParams, "useSSL=false");
 });
 
 test("leaves non-JDBC MySQL user and password URL params untouched", () => {
@@ -110,6 +316,65 @@ test("parses JDBC URLs by using the inner database URL", () => {
   assert.equal(mysql.password, "p@ss");
   assert.equal(mysql.database, "shop");
   assert.equal(mysql.urlParams, "charset=utf8mb4");
+});
+
+test("parses Hive JDBC URLs using HTTP transport", () => {
+  const source = "jdbc:hive2://hive.example.com:20001/;transportMode=http;httpPath=cliservice;auth=noSasl";
+  const parsed = parseConnectionUrl(source);
+
+  assert.equal(parsed.dbType, "hive");
+  assert.equal(parsed.driverProfile, "hive");
+  assert.equal(parsed.driverLabel, "Apache Hive");
+  assert.equal(parsed.host, "hive.example.com");
+  assert.equal(parsed.port, 20001);
+  assert.equal(parsed.database, undefined);
+  assert.equal(parsed.urlParams, "transportMode=http;httpPath=cliservice;auth=noSasl");
+  assert.equal(parsed.connectionString, source);
+});
+
+test("preserves Hive HTTP URL parameters after the noSasl authentication setting", () => {
+  const source = "jdbc:hive2://hive.example.com:20001/;transportMode=http;httpPath=cliservice;auth=noSasl?ds=2";
+  const parsed = parseConnectionUrl(source);
+
+  assert.equal(parsed.dbType, "hive");
+  assert.equal(parsed.host, "hive.example.com");
+  assert.equal(parsed.port, 20001);
+  assert.equal(parsed.urlParams, "transportMode=http;httpPath=cliservice;auth=noSasl?ds=2");
+  assert.equal(parsed.connectionString, source);
+});
+
+test("parses Hive JDBC URLs with a database and SSL parameter", () => {
+  const source = "jdbc:hive2://hive.example.com/default;transportMode=http;httpPath=cliservice;ssl=true";
+  const parsed = parseConnectionUrl(source);
+
+  assert.equal(parsed.host, "hive.example.com");
+  assert.equal(parsed.port, 10000);
+  assert.equal(parsed.database, "default");
+  assert.equal(parsed.urlParams, "transportMode=http;httpPath=cliservice");
+  assert.equal(parsed.ssl, true);
+  assert.equal(parsed.connectionString, source);
+});
+
+test("preserves multi-host Hive ZooKeeper JDBC URLs", () => {
+  const source = "jdbc:hive2://zk1.example.com:2181,zk2.example.com:2181/default;serviceDiscoveryMode=zooKeeper;zooKeeperNamespace=hiveserver2";
+  const parsed = parseConnectionUrl(source);
+
+  assert.equal(parsed.host, "zk1.example.com");
+  assert.equal(parsed.port, 2181);
+  assert.equal(parsed.database, "default");
+  assert.equal(parsed.urlParams, "serviceDiscoveryMode=zooKeeper;zooKeeperNamespace=hiveserver2");
+  assert.equal(parsed.connectionString, source);
+});
+
+test("maps Hive JDBC credentials and SSL to structured fields while preserving parameter sections", () => {
+  const source = "jdbc:hive2://hive.example.com:10000/analytics;user=alice;password=secret;ssl=true;transportMode=http?hive.exec.dynamic.partition=true#SourceTable=events";
+  const parsed = parseConnectionUrl(source);
+
+  assert.equal(parsed.username, "alice");
+  assert.equal(parsed.password, "secret");
+  assert.equal(parsed.ssl, true);
+  assert.equal(parsed.urlParams, "transportMode=http?hive.exec.dynamic.partition=true#SourceTable=events");
+  assert.equal(parsed.connectionString, source);
 });
 
 test("parses TDengine WebSocket JDBC URLs", () => {
@@ -157,9 +422,9 @@ test("parses Apache IoTDB JDBC URLs", () => {
 test("parses GBase 8s JDBC URLs", () => {
   const parsed = parseConnectionUrl("jdbc:gbasedbt-sqli://gbasedbt:secret@gbase.example.com:20013/testdb:GBASEDBTSERVER=gbase01;CLIENT_LOCALE=zh_cn.utf8");
 
-  assert.equal(parsed.dbType, "gbase");
+  assert.equal(parsed.dbType, "gbase8s");
   assert.equal(parsed.driverProfile, "gbase8s");
-  assert.equal(parsed.driverLabel, "GBase 8s");
+  assert.equal(parsed.driverLabel, "南大通用 GBase 8s");
   assert.equal(parsed.host, "gbase.example.com");
   assert.equal(parsed.port, 20013);
   assert.equal(parsed.username, "gbasedbt");
@@ -235,6 +500,78 @@ test("parses SQL Server JDBC URLs with semicolon properties", () => {
   assert.equal(parsed.password, "s@cret");
   assert.equal(parsed.database, "erp");
   assert.equal(parsed.urlParams, "encrypt=true");
+  assert.equal(parsed.portExplicit, true);
+});
+
+test("marks explicit SQL Server default port when applying connection URLs", () => {
+  const parsed = parseConnectionUrl("jdbc:sqlserver://sql.example.com\\SQLEXPRESS:1433;databaseName=erp;user=sa;password=secret");
+  const applied = applyParsedConnectionUrl({ name: "", db_type: "sqlserver", username: "", password: "" } as any, parsed);
+
+  assert.equal(parsed.port, 1433);
+  assert.equal(parsed.portExplicit, true);
+  assert.deepEqual(applied.external_config, { portExplicit: true });
+});
+
+test("does not mark SQL Server default port explicit when connection URL omits it", () => {
+  const parsed = parseConnectionUrl("jdbc:sqlserver://sql.example.com\\SQLEXPRESS;databaseName=erp;user=sa;password=secret");
+  const applied = applyParsedConnectionUrl({ name: "", db_type: "sqlserver", username: "", password: "" } as any, parsed);
+
+  assert.equal(parsed.port, 1433);
+  assert.equal(parsed.portExplicit, undefined);
+  assert.equal(applied.external_config, undefined);
+});
+
+test("parses H2 split JDBC URLs as file connections", () => {
+  const source = "jdbc:h2:split:28:C:/dbx-test/h2/sample-db;AUTO_SERVER=TRUE";
+  const parsed = parseConnectionUrl(source);
+
+  assert.equal(parsed.dbType, "h2");
+  assert.equal(parsed.driverProfile, "h2");
+  assert.equal(parsed.driverLabel, "H2");
+  assert.equal(parsed.host, "C:/dbx-test/h2/sample-db");
+  assert.equal(parsed.port, 0);
+  assert.equal(parsed.username, "sa");
+  assert.equal(parsed.password, "");
+  assert.equal(parsed.database, "sample-db");
+  assert.equal(parsed.urlParams, "AUTO_SERVER=TRUE");
+  assert.equal(parsed.connectionString, source);
+});
+
+test("parses H2 TCP JDBC URLs as server connections", () => {
+  const source = "jdbc:h2:tcp://localhost:9123/~/sample-db;USER=sa;PASSWORD=s%40cret;MODE=MySQL";
+  const parsed = parseConnectionUrl(source);
+
+  assert.equal(parsed.dbType, "h2");
+  assert.equal(parsed.driverProfile, "h2");
+  assert.equal(parsed.driverLabel, "H2");
+  assert.equal(parsed.host, "localhost");
+  assert.equal(parsed.port, 9123);
+  assert.equal(parsed.username, "sa");
+  assert.equal(parsed.password, "s@cret");
+  assert.equal(parsed.database, "~/sample-db");
+  assert.equal(parsed.urlParams, "MODE=MySQL");
+  assert.equal(parsed.ssl, false);
+  assert.equal(parsed.connectionString, source);
+});
+
+test("keeps typed H2 credentials when JDBC URL does not include them", () => {
+  const parsed = parseConnectionUrl("jdbc:h2:split:28:C:/dbx-test/h2/sample-db;AUTO_SERVER=TRUE");
+  const applied = applyParsedConnectionUrl({ name: "", db_type: "h2", username: "typed-user", password: "typed-secret" } as any, parsed);
+
+  assert.equal(applied.username, "typed-user");
+  assert.equal(applied.password, "typed-secret");
+});
+
+test("uses H2 JDBC URL credentials when they are included", () => {
+  const parsed = parseConnectionUrl("jdbc:h2:split:28:C:/dbx-test/h2/sample-db;USER=url-user;PASSWORD=url-secret;AUTO_SERVER=TRUE");
+  const applied = applyParsedConnectionUrl({ name: "", db_type: "h2", username: "typed-user", password: "typed-secret" } as any, parsed);
+
+  assert.equal(applied.username, "url-user");
+  assert.equal(applied.password, "url-secret");
+});
+
+test("rebuilds H2 split JDBC URLs with an edited file path", () => {
+  assert.equal(h2FileJdbcUrlWithPath("jdbc:h2:split:28:C:/dbx-test/h2/sample-db;AUTO_SERVER=TRUE", "D:/dbx/new-sample.mv.db"), "jdbc:h2:split:28:D:/dbx/new-sample;AUTO_SERVER=TRUE");
 });
 
 test("parses Oracle JDBC service URLs", () => {
@@ -306,6 +643,18 @@ test("uses selected HTTP-compatible profile for HTTP URLs", () => {
   assert.equal(parsed.host, "search.example.com");
   assert.equal(parsed.port, 9243);
   assert.equal(parsed.ssl, true);
+});
+
+test("parses Easysearch URLs and keeps the selected HTTPS profile", () => {
+  const dedicated = parseConnectionUrl("easysearch://dbx_test:secret@search.example.com:9200");
+  const https = parseConnectionUrl("https://search.example.com:9243", "easysearch");
+
+  assert.equal(dedicated.dbType, "easysearch");
+  assert.equal(dedicated.driverProfile, "easysearch");
+  assert.equal(dedicated.username, "dbx_test");
+  assert.equal(https.dbType, "easysearch");
+  assert.equal(https.port, 9243);
+  assert.equal(https.ssl, true);
 });
 
 test("parses HTTPS ClickHouse URLs with selected profile", () => {

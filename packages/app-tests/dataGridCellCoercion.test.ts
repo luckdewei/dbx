@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
-import { coerceDataGridCellValue, dataGridCellDisplayText, dataGridCellEditorText } from "../../apps/desktop/src/lib/dataGridCellCoercion.ts";
+import { coerceDataGridCellValue, dataGridCellDisplayText, dataGridCellEditorText } from "../../apps/desktop/src/lib/dataGrid/dataGridCellCoercion.ts";
 
 test("formats Postgres array cells with native brace syntax", () => {
   const columnInfo = { data_type: "_text" };
@@ -47,6 +47,50 @@ test("coerces PG brace-style input for Postgres array columns", () => {
   );
 });
 
+test("preserves high precision numeric edits as text", () => {
+  assert.equal(
+    coerceDataGridCellValue({
+      value: "144847503924137986",
+      oldValue: 142189065666650,
+      databaseType: "sqlserver",
+      columnInfo: { data_type: "bigint" },
+    }),
+    "144847503924137986",
+  );
+
+  assert.equal(
+    coerceDataGridCellValue({
+      value: "12345678901234567890123456789012345678",
+      oldValue: 1,
+      databaseType: "postgres",
+      columnInfo: { data_type: "numeric(38,0)" },
+    }),
+    "12345678901234567890123456789012345678",
+  );
+});
+
+test("keeps safe numeric edits on the existing number path", () => {
+  assert.equal(
+    coerceDataGridCellValue({
+      value: "42",
+      oldValue: 1,
+      databaseType: "sqlserver",
+      columnInfo: { data_type: "int" },
+    }),
+    42,
+  );
+
+  assert.strictEqual(
+    coerceDataGridCellValue({
+      value: "42",
+      oldValue: 42,
+      databaseType: "sqlserver",
+      columnInfo: { data_type: "bigint" },
+    }),
+    42,
+  );
+});
+
 test("coerces PG brace-style string array", () => {
   assert.deepEqual(
     coerceDataGridCellValue({
@@ -56,6 +100,18 @@ test("coerces PG brace-style string array", () => {
       columnInfo: { data_type: "_text" },
     }),
     ["draft", "needs space", "发布"],
+  );
+});
+
+test("preserves high precision numeric tokens in Postgres arrays", () => {
+  assert.deepEqual(
+    coerceDataGridCellValue({
+      value: "{144847503924137986,2}",
+      oldValue: [],
+      databaseType: "postgres",
+      columnInfo: { data_type: "_int8" },
+    }),
+    ["144847503924137986", 2],
   );
 });
 
@@ -135,4 +191,67 @@ test("changed PG array value returns new array reference", () => {
 
   assert.notStrictEqual(result, oldValue);
   assert.deepEqual(result, [1, 2, 3, 4]);
+});
+
+test("MySQL text BLOB editor decodes UTF-8 and writes edited bytes as hex", () => {
+  const oldValue = "0x2332303035383035";
+  const columnInfo = { data_type: "longblob" };
+
+  assert.equal(dataGridCellEditorText({ value: oldValue, databaseType: "mysql", columnInfo }), "#2005805");
+  assert.strictEqual(coerceDataGridCellValue({ value: "#2005805", oldValue, databaseType: "mysql", columnInfo }), oldValue);
+  assert.equal(coerceDataGridCellValue({ value: "新表达式", oldValue, databaseType: "mysql", columnInfo }), "0xe696b0e8a1a8e8bebee5bc8f");
+  assert.equal(coerceDataGridCellValue({ value: "", oldValue, databaseType: "mysql", columnInfo }), "0x");
+});
+
+test("MySQL binary BLOB editor keeps non-text bytes in hex", () => {
+  const oldValue = "0x89504e470d0a1a0a";
+  const columnInfo = { data_type: "longblob" };
+
+  assert.equal(dataGridCellEditorText({ value: oldValue, databaseType: "mysql", columnInfo }), oldValue);
+  assert.equal(coerceDataGridCellValue({ value: oldValue, oldValue, databaseType: "mysql", columnInfo }), oldValue);
+});
+
+test("Oracle and OceanBase-Oracle text BLOB editor decodes UTF-8 and writes edited bytes as hex", () => {
+  const oldValue = "0x2332303035383035";
+  const columnInfo = { data_type: "blob" };
+
+  for (const databaseType of ["oracle", "oceanbase-oracle"] as const) {
+    assert.equal(dataGridCellEditorText({ value: oldValue, databaseType, columnInfo }), "#2005805");
+    assert.strictEqual(coerceDataGridCellValue({ value: "#2005805", oldValue, databaseType, columnInfo }), oldValue);
+    assert.equal(coerceDataGridCellValue({ value: "新表达式", oldValue, databaseType, columnInfo }), "0xe696b0e8a1a8e8bebee5bc8f");
+    assert.equal(coerceDataGridCellValue({ value: "", oldValue, databaseType, columnInfo }), "0x");
+  }
+});
+
+test("PostgreSQL text BYTEA editor decodes UTF-8 and writes edited bytes as hex (#11987)", () => {
+  const oldValueHex = "0x48656c6c6f";
+  const oldValuePgEscape = "\\x48656c6c6f";
+  const columnInfo = { data_type: "bytea" };
+
+  for (const oldValue of [oldValueHex, oldValuePgEscape]) {
+    assert.equal(dataGridCellEditorText({ value: oldValue, databaseType: "postgres", columnInfo }), "Hello");
+    assert.strictEqual(coerceDataGridCellValue({ value: "Hello", oldValue, databaseType: "postgres", columnInfo }), oldValue);
+    assert.equal(coerceDataGridCellValue({ value: "新内容", oldValue, databaseType: "postgres", columnInfo }), "0xe696b0e58685e5aeb9");
+    assert.equal(coerceDataGridCellValue({ value: "", oldValue, databaseType: "postgres", columnInfo }), "0x");
+    assert.equal(coerceDataGridCellValue({ value: "", oldValue, databaseType: "postgres", columnInfo, emptyStringAsNull: true }), null);
+  }
+});
+
+test("PostgreSQL binary BYTEA editor keeps non-text bytes in hex (#11987)", () => {
+  const oldValueHex = "0x89504e470d0a1a0a";
+  const oldValuePgEscape = "\\x89504e470d0a1a0a";
+  const columnInfo = { data_type: "bytea" };
+
+  for (const oldValue of [oldValueHex, oldValuePgEscape]) {
+    assert.equal(dataGridCellEditorText({ value: oldValue, databaseType: "postgres", columnInfo }), oldValue);
+    assert.equal(coerceDataGridCellValue({ value: oldValue, oldValue, databaseType: "postgres", columnInfo }), oldValue);
+  }
+});
+
+test("non-PostgreSQL BYTEA editor keeps bytes in hex", () => {
+  const oldValue = "0x48656c6c6f";
+  const columnInfo = { data_type: "bytea" };
+
+  assert.equal(dataGridCellEditorText({ value: oldValue, databaseType: "sqlite", columnInfo }), oldValue);
+  assert.equal(coerceDataGridCellValue({ value: "Hello", oldValue, databaseType: "sqlite", columnInfo }), "Hello");
 });

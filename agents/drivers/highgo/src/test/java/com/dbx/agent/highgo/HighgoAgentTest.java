@@ -29,6 +29,15 @@ class HighgoAgentTest extends JdbcFakeExecutionBehaviorTest {
     }
 
     @Test
+    void preservesPublicFunctionsWhenSwitchingSchemas() {
+        HighgoAgent agent = new HighgoAgent();
+
+        Assertions.assertEquals("SET search_path TO \"app\", public", agent.setSchemaSQL("app"));
+        Assertions.assertEquals("SET search_path TO \"public\"", agent.setSchemaSQL("public"));
+        Assertions.assertEquals("SET search_path TO \"PUBLIC\", public", agent.setSchemaSQL("PUBLIC"));
+    }
+
+    @Test
     void readsViewSourceWithQuotedRegclassParameter() {
         HighgoAgent agent = new HighgoAgent();
         TestSupport.setPrivateConnection(agent, JdbcMetadataSqlFake.connection());
@@ -37,7 +46,7 @@ class HighgoAgentTest extends JdbcFakeExecutionBehaviorTest {
 
         Assertions.assertEquals(
             Arrays.asList(
-                "SELECT pg_get_viewdef(to_regclass(?), true)",
+                "SELECT pg_catalog.pg_get_viewdef(pg_catalog.to_regclass(?), true)",
                 "param:1=\"bad\"\"schema\".\"view's name\""
             ),
             JdbcMetadataSqlFake.statements

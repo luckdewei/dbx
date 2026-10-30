@@ -3,7 +3,7 @@ import { computed } from "vue";
 import { useI18n } from "vue-i18n";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import type { GeneratorParams } from "@/lib/dataGenerate";
+import type { GeneratorParams } from "@/lib/dataGrid/dataGenerate";
 
 const props = defineProps<{ params: GeneratorParams }>();
 
@@ -49,7 +49,7 @@ const isGenerate = computed(() => props.params.imageMode !== "folder");
           <Input v-model="params.folderPath" type="text" placeholder="/path/to/images" class="h-7 text-xs" />
         </div>
         <div class="text-xs text-muted-foreground mt-2 mb-1">{{ t("dataGenerate.filterByExtension") }}</div>
-        <textarea v-model="params.fileExtensions" rows="3" class="w-full rounded border bg-background px-2 py-1 text-xs font-mono resize-y" placeholder="每行一个扩展名&#10;png&#10;jpg&#10;txt" />
+        <textarea v-model="params.fileExtensions" rows="3" class="w-full rounded border bg-background px-2 py-1 text-xs font-mono resize-y" :placeholder="t('dataGenerate.placeholders.fileExtensions')" />
       </div>
     </template>
   </div>

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { buildTreeNodesFromLayout, deleteGroup, moveConnectionToGroup, reconcileLayout, reorderEntry } from "../../apps/desktop/src/lib/sidebarLayout.ts";
+import { buildTreeNodesFromLayout, deleteGroup, moveConnectionToGroup, reconcileLayout, reorderEntry } from "../../apps/desktop/src/lib/sidebar/sidebarLayout.ts";
 import type { ConnectionConfig, SidebarLayout } from "../../apps/desktop/src/types/database.ts";
 
 function conn(id: string): ConnectionConfig {
@@ -77,7 +77,7 @@ test("moves connections and groups into nested groups", () => {
   ]);
 });
 
-test("deleting a parent group keeps nested child groups", () => {
+test("deleting a parent group removes nested child groups and promotes their connections", () => {
   const layout: SidebarLayout = {
     groups: [
       { id: "g1", name: "Parent", collapsed: false },
@@ -88,6 +88,6 @@ test("deleting a parent group keeps nested child groups", () => {
 
   const next = deleteGroup(layout, "g1");
 
-  assert.deepEqual(next.groups, [{ id: "g2", name: "Child", collapsed: false }]);
-  assert.deepEqual(next.order, [{ type: "group", id: "g2", children: [{ type: "connection", id: "c1" }] }]);
+  assert.deepEqual(next.groups, []);
+  assert.deepEqual(next.order, [{ type: "connection", id: "c1" }]);
 });
